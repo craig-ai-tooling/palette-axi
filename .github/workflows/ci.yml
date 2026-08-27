@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check (palette-axi is stdlib-only, no install step needed)
+        run: python3 -m py_compile palette-axi
+
+      - name: Unit tests
+        run: python3 -m unittest test_palette_axi -v
+
+      - name: --help smoke test (no network, no credentials required)
+        run: |
+          ./palette-axi --help
+          for verb in projects clusters cluster profiles profile edgehosts events packs; do
+            ./palette-axi "$verb" --help
+          done

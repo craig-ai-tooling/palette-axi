@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""palette-axi — agent-ergonomic CLI over the Spectro Cloud Palette API.
+
+Built on the same AXI (Agent eXperience Interface) principles as opp-axi:
+TOON output, minimal default schemas, truncation with --full escape hatches,
+pre-computed aggregates, definitive empty states, structured exit codes,
+content-first output, and next-step disclosure.
+
+READ-ONLY. No verb in this tool creates, updates, deletes, or deploys
+anything against Palette. See README.md "Future work" for the write case
+that was deliberately left out.
+
+Auth: PALETTE_API_KEY env var wins if set. Otherwise the key is pulled from
+1Password (vault "Lobster", or $PALETTE_AXI_VAULT) by resolving the item
+titled "Palette API Key (<tenant>)" to its ITEM ID first — op:// references
+break on titles containing parentheses, so this tool never builds one.
+Default tenant is "custeng-prod"; override with --tenant or $PALETTE_AXI_TENANT.
+
+ProjectUid: most verbs need one. Pass --project by name or UID, or set
+$PALETTE_PROJECT. A name is resolved via GET /v1/projects (case-insensitive
+substring match); ambiguous or missing matches are a hard error listing the
+candidates — this tool never guesses which project you meant.
+
+Env overrides: PALETTE_API_KEY, PALETTE_PROJECT, PALETTE_AXI_TENANT,
+PALETTE_AXI_VAULT (default Lobster), PALETTE_AXI_OP_ITEM (skip tenant
+resolution and use this 1Password item id directly).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_BASE = "https://api.spectrocloud.com"
+DEFAULT_TENANT = os.environ.get("PALETTE_AXI_TENANT", "custeng-prod")
+OP_VAULT = os.environ.get("PALETTE_AXI_VAULT", "Lobster")
+UID_RE = re.compile(r"^[0-9a-f]{24}$")
+
+# Exit codes — mirrors opp-axi's contract so both tools compose in the same
+# pipeline/agent loop without the caller needing two different tables.
+#   0 E_OK        success
+#   1 E_ERR       API/network/op error, or any failure not covered below
+#   2 E_USAGE     bad args, or an ambiguous name that needs disambiguating
+#   3 E_NOTFOUND  no such project/cluster/profile/edge host/pack
+#   4 E_REFUSED   refused on policy grounds (reserved — v1 has no write path
+#                 to refuse, kept for symmetry and for any future verb that
+#                 needs to say no rather than fail)
+E_OK, E_ERR, E_USAGE, E_NOTFOUND, E_REFUSED = 0, 1, 2, 3, 4
+
+
+# ── output (copied verbatim from opp-axi — both tools must agree) ──────────
+def _tv(v):
+    """TOON scalar: quote only when it would break the row.
+
+    None and False are DIFFERENT facts and must not share a cell. Collapsing
+    False into "" made "POV not required" read identically to "nobody knows",
+    which is exactly the kind of silent wrong answer this tool exists to stop.
+    Empty means unknown; false means known-false."""
+    if v is None:
+        return ""
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    s = str(v).replace("\r", "")
+    if any(c in s for c in ',"\n'):
+        return '"' + s.replace('"', '""').replace("\n", "\\n") + '"'
+    return s
+
+
+def toon(name, fields, rows, indent="  "):
+    """TOON block. rows==[] yields a definitive `name[0]{...}: (none)` — never ambiguous."""
+    head = f"{name}[{len(rows)}]{{{','.join(fields)}}}:"
+    if not rows:
+        return head + " (none)"
+    return "\n".join([head] + [indent + ",".join(_tv(r.get(f)) for f in fields) for r in rows])
+
+
+def emit(*parts):
+    print("\n".join(p for p in parts if p))
+
+
+def nxt(*suggestions):
+    """Contextual disclosure — what to run next, not a wall of help text."""
+    return "\nnext: " + " | ".join(suggestions) if suggestions else ""
+
+
+def die(msg, code=E_ERR):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def size_hint(full, shown):
+    extra = len(full) - len(shown)
+    return f"  [+{extra}B truncated, --full]" if extra > 0 else ""
+
+
+def trunc(s, n=90):
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def ts(s):
+    """Trim an RFC3339 timestamp to minute precision for table display."""
+    return (s or "")[:16].replace("T", " ")
+
+
+def is_unhealthy(health):
+    """Cluster health uses 'Healthy'/'Unhealthy'; edge host health uses lowercase
+    'healthy'/'unhealthy' (confirmed live, both APIs) — compare case-insensitively
+    rather than trusting either casing."""
+    return bool(health) and health.lower() != "healthy"
+
+
+def dget(d, key):
+    """d.get(key, {}) does NOT protect against an explicit JSON null for key —
+    confirmed live, pack objects carry "status": null rather than omitting it.
+    Use this instead of .get(key, {}) for any nested object field."""
+    return (d or {}).get(key) or {}
+
+
+# ── 1Password (Lobster vault, item ID only — see module docstring) ─────────
+def _run(cmd, timeout=30, input_text=None):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
+    except subprocess.TimeoutExpired:
+        die(f"timeout after {timeout}s: {' '.join(cmd[:2])}")
+    except FileNotFoundError:
+        die(f"not found on PATH: {cmd[0]}")
+
+
+def _op_item_id_for_tenant(tenant):
+    """'Palette API Key (<tenant>)' -> item id, via `op item list` (never op:// —
+    titles with parens break that syntax). Service accounts need --vault explicit."""
+    p = _run(["op", "item", "list", "--vault", OP_VAULT, "--format", "json"], timeout=20)
+    if p.returncode != 0:
+        die(f"op item list --vault {OP_VAULT} failed: {(p.stderr or '').strip()[:300]}")
+    try:
+        items = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        die("op item list returned non-JSON output")
+    want = f"palette api key ({tenant.lower()})"
+    exact = [i for i in items if (i.get("title") or "").strip().lower() == want]
+    if exact:
+        return exact[0]["id"]
+    loose = [i for i in items if "palette" in (i.get("title") or "").lower()
+             and tenant.lower() in (i.get("title") or "").lower()]
+    if not loose:
+        titles = sorted(i["title"] for i in items if "palette api key" in (i.get("title") or "").lower())
+        die(f"no 1Password item 'Palette API Key ({tenant})' in vault {OP_VAULT}. "
+            f"Known tenants: {', '.join(titles) or '(none found)'}", E_NOTFOUND)
+    if len(loose) > 1:
+        die(f"ambiguous tenant '{tenant}': " + ", ".join(i["title"] for i in loose), E_USAGE)
+    return loose[0]["id"]
+
+
+def _op_secret_value(item_id):
+    """Pull the credential field out of an op item without ever printing it.
+    Tenant items are hand-created and label their secret 'password' or
+    'credential' inconsistently — check both rather than assuming one."""
+    p = _run(["op", "item", "get", item_id, "--vault", OP_VAULT, "--format", "json"], timeout=20)
+    if p.returncode != 0:
+        die(f"op item get {item_id} --vault {OP_VAULT} failed: {(p.stderr or '').strip()[:300]}")
+    try:
+        d = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        die(f"op item get {item_id}: non-JSON output")
+    for f in d.get("fields", []):
+        label = (f.get("label") or "").lower()
+        fid = (f.get("id") or "").lower()
+        if fid in ("password", "credential") or label in ("password", "credential", "api key", "apikey"):
+            v = f.get("value")
+            if v:
+                return v
+    die(f"item {item_id} has no password/credential field with a value", E_ERR)
+
+
+def get_api_key(tenant):
+    env_key = os.environ.get("PALETTE_API_KEY")
+    if env_key:
+        return env_key
+    item_id = os.environ.get("PALETTE_AXI_OP_ITEM") or _op_item_id_for_tenant(tenant)
+    return _op_secret_value(item_id)
+
+
+# ── Palette API ──────────────────────────────────────────────────────────
+def api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+    url = f"{API_BASE}{path}"
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+    headers = {"ApiKey": api_key, "Accept": "application/json"}
+    if project:
+        headers["ProjectUid"] = project
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        try:
+            j = json.loads(body)
+            msg = j.get("message") or j.get("error") or str(j)[:300]
+        except Exception:
+            msg = body.decode(errors="replace")[:300] or e.reason
+        code = E_NOTFOUND if e.code == 404 else E_ERR
+        die(f"{method} {path} -> HTTP {e.code}: {msg}", code)
+    except urllib.error.URLError as e:
+        die(f"network error calling {path}: {e.reason}")
+
+
+def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=10):
+    """Page via listmeta.continue when the endpoint returns one — confirmed live
+    that's the stable mechanism (packs, clusterprofiles). Raw offset increments
+    are a fallback for endpoints that provide no continue token; some of those
+    genuinely don't honor offset at all (/v1/projects always returns the same
+    first 50 rows no matter what offset is sent) and others (edgehosts) return
+    no listmeta whatsoever. Progress is tracked by uid so a page that adds
+    nothing new ends the loop instead of spinning for max_pages.
+
+    Even continue-token pagination was observed live to lose 2 of 146 rows on
+    /v1/clusterprofiles — listmeta.count itself can run slightly ahead of what
+    the API actually hands back page by page. LAST_LIST_TRUNCATED is set so
+    callers can say so instead of silently showing a partial list as complete."""
+    items, seen, offset, cont = [], set(), 0, None
+    total = None
+    for _ in range(max_pages):
+        params = {"limit": page_limit, "filters": filters}
+        params["continue"] = cont if cont else None
+        if not cont:
+            params["offset"] = offset
+        data = api("GET", path, api_key, project, params)
+        if total is None:
+            total = dget(data, "listmeta").get("count")
+        batch = data.get("items") or []
+        new = [b for b in batch if dget(b, "metadata").get("uid") not in seen]
+        if not new:
+            break
+        for b in new:
+            seen.add(dget(b, "metadata").get("uid"))
+        items.extend(new)
+        cont = dget(data, "listmeta").get("continue")
+        if cont:
+            continue
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    _set_truncated(len(items), total)
+    return items
+
+
+LAST_LIST_TRUNCATED = False
+LAST_LIST_GOT = LAST_LIST_TOTAL = 0
+
+
+def _set_truncated(got, total):
+    global LAST_LIST_TRUNCATED, LAST_LIST_GOT, LAST_LIST_TOTAL
+    LAST_LIST_GOT, LAST_LIST_TOTAL = got, total or got
+    LAST_LIST_TRUNCATED = bool(total and got < total)
+
+
+def truncation_note():
+    # Confirmed live: /v1/projects ignores limit/offset entirely and caps at 50
+    # regardless of listmeta.count; /v1/clusterprofiles pages correctly via
+    # listmeta.continue but still dropped 2 of 146 rows in the same test run —
+    # this endpoint's own pagination is not fully reliable, not a bug in list_all.
+    return (f"\nnote: API returned {LAST_LIST_GOT} of {LAST_LIST_TOTAL} "
+            "(listmeta.count) — this endpoint's pagination did not hand back the "
+            "full list; some rows may be missing." if LAST_LIST_TRUNCATED else "")
+
+
+def list_clusters(api_key, project, page_limit=50, max_pages=10):
+    """GET /v1/spectroclusters carries no status.health at all — confirmed live.
+    The health field only comes back from the dashboard search/overview surface,
+    which real sessions reached for exactly this reason. This is a POST (it takes
+    a filter body), but it is a search, not a mutation — still read-only."""
+    body = {"filter": {"conjunction": "and", "filterGroups": []}, "sort": []}
+    items, seen, offset, cont = [], set(), 0, None
+    total = None
+    for _ in range(max_pages):
+        params = {"limit": page_limit}
+        params["continue"] = cont if cont else None
+        if not cont:
+            params["offset"] = offset
+        data = api("POST", "/v1/dashboard/spectroclusters/search", api_key, project, params, json_body=body)
+        if total is None:
+            total = dget(data, "listmeta").get("count")
+        batch = data.get("items") or []
+        new = [b for b in batch if dget(b, "metadata").get("uid") not in seen]
+        if not new:
+            break
+        for b in new:
+            seen.add(dget(b, "metadata").get("uid"))
+        items.extend(new)
+        cont = dget(data, "listmeta").get("continue")
+        if cont:
+            continue
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    _set_truncated(len(items), total)
+    return items
+
+
+# ── project / resource resolution ───────────────────────────────────────
+def resolve_project(ref, api_key):
+    ref = ref or os.environ.get("PALETTE_PROJECT")
+    if not ref:
+        die("no --project given (or set PALETTE_PROJECT). Run 'palette-axi projects' to list options.", E_USAGE)
+    if UID_RE.match(ref):
+        return ref
+    items = list_all("/v1/projects", api_key)
+    exact = [p for p in items if (dget(p, "metadata").get("name") or "").lower() == ref.lower()]
+    if exact:
+        return exact[0]["metadata"]["uid"]
+    cands = [p for p in items if ref.lower() in (dget(p, "metadata").get("name") or "").lower()]
+    if not cands:
+        die(f"no project matching '{ref}'", E_NOTFOUND)
+    if len(cands) > 1:
+        names = ", ".join(sorted(p["metadata"]["name"] for p in cands))
+        die(f"ambiguous project '{ref}': {names}", E_USAGE)
+    return cands[0]["metadata"]["uid"]
+
+
+def resolve_by_name(ref, items, kind):
+    """uid | exact name | unique substring -> item. Same disambiguation contract
+    as resolve_project: never guess, always name the candidates."""
+    if UID_RE.match(ref):
+        hit = next((i for i in items if dget(i, "metadata").get("uid") == ref), None)
+        if not hit:
+            die(f"no {kind} with uid {ref}", E_NOTFOUND)
+        return hit
+    exact = [i for i in items if (dget(i, "metadata").get("name") or "").lower() == ref.lower()]
+    if exact:
+        return exact[0]
+    cands = [i for i in items if ref.lower() in (dget(i, "metadata").get("name") or "").lower()]
+    if not cands:
+        die(f"no {kind} matching '{ref}'", E_NOTFOUND)
+    if len(cands) > 1:
+        names = ", ".join(sorted(i["metadata"]["name"] for i in cands))
+        die(f"ambiguous {kind} '{ref}': {names}", E_USAGE)
+    return cands[0]
+
+
+# ── commands ───────────────────────────────────────────────────────────
+def cmd_projects(a):
+    key = get_api_key(a.tenant)
+    items = list_all("/v1/projects", key)
+    rows = [{"name": p["metadata"]["name"], "uid": p["metadata"]["uid"],
+             "default": dget(p, "spec").get("isDefault", False)} for p in items]
+    emit(f"tenant={a.tenant}",
+         toon("projects", ["name", "uid", "default"], rows),
+         f"\ncount:{len(rows)}" + truncation_note(),
+         nxt("palette-axi clusters --project <name>", "palette-axi edgehosts --project <name>"))
+
+
+def _cloud_type(c):
+    return (dget(c, "spec").get("cloudType")
+            or dget(dget(c, "specSummary"), "cloudConfig").get("cloudType"))
+
+
+def cmd_clusters(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_clusters(key, proj)
+    if a.edge:
+        items = [c for c in items if _cloud_type(c) == "edge-native"]
+    rows = []
+    for c in items:
+        m, st = dget(c, "metadata"), dget(c, "status")
+        rows.append({"name": m.get("name"), "uid": m.get("uid"),
+                     "cloudType": _cloud_type(c),
+                     "state": st.get("state"), "health": dget(st, "health").get("state")})
+    unhealthy = sum(1 for r in rows if is_unhealthy(r["health"]))
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("clusters", ["name", "uid", "cloudType", "state", "health"], rows),
+         f"\ncount:{len(rows)} unhealthy:{unhealthy}" + truncation_note(),
+         nxt("palette-axi cluster <name>", "palette-axi events <name>"))
+
+
+def cmd_cluster(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_clusters(key, proj)
+    hit = resolve_by_name(a.ref, items, "cluster")
+    uid = hit["metadata"]["uid"]
+    # Plain GET /v1/spectroclusters/{uid} carries no status.health — only the
+    # dashboard overview does (confirmed live) — so pull created/pools from the
+    # plain resource and state/health/conditions from the overview.
+    c = api("GET", f"/v1/spectroclusters/{uid}", key, proj)
+    overview = api("GET", f"/v1/dashboard/spectroclusters/{uid}/overview", key, proj)
+    m, sp = dget(c, "metadata"), dget(c, "spec")
+    ost = dget(overview, "status")
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("cluster", ["name", "uid", "cloudType", "state", "health", "created"],
+              [{"name": m.get("name"), "uid": uid, "cloudType": _cloud_type(c) or _cloud_type(overview),
+                "state": ost.get("state"), "health": dget(ost, "health").get("state"),
+                "created": ts(m.get("creationTimestamp"))}]))
+
+    pools = dget(sp, "cloudConfig").get("machinePools") or []
+    if pools:
+        prows = [{"name": p.get("name"), "size": p.get("size"),
+                  "controlPlane": p.get("controlPlane", False)} for p in pools]
+        emit(toon("pools", ["name", "size", "controlPlane"], prows))
+
+    conds = ost.get("conditions") or []
+    show = conds if a.full else [c2 for c2 in conds if c2.get("status") != "True"]
+    crows = [{"type": c2.get("type"), "status": c2.get("status"),
+              "reason": c2.get("reason"), "message": trunc(c2.get("message"), 100)} for c2 in show]
+    emit(toon("conditions", ["type", "status", "reason", "message"], crows))
+    emit(nxt(f"palette-axi events {m.get('name')} --project {proj}",
+             f"palette-axi cluster {m.get('name')} --project {proj} --full") if not a.full
+         else nxt(f"palette-axi events {m.get('name')} --project {proj}"))
+
+
+def cmd_profiles(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_all("/v1/clusterprofiles", key, proj)
+    rows = []
+    for p in items:
+        m, sp = dget(p, "metadata"), dget(p, "spec")
+        rows.append({"name": m.get("name"), "uid": m.get("uid"),
+                     "version": sp.get("version"), "type": dget(sp, "published").get("type"),
+                     "cloudType": sp.get("cloudType")})
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("profiles", ["name", "uid", "version", "type", "cloudType"], rows),
+         f"\ncount:{len(rows)}" + truncation_note(),
+         nxt("palette-axi profile <name>"))
+
+
+def cmd_profile(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_all("/v1/clusterprofiles", key, proj)
+    hit = resolve_by_name(a.ref, items, "profile")
+    uid = hit["metadata"]["uid"]
+    p = api("GET", f"/v1/clusterprofiles/{uid}", key, proj)
+    m, sp = dget(p, "metadata"), dget(p, "spec")
+    pub = dget(sp, "published")
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("profile", ["name", "uid", "version", "type", "cloudType"],
+              [{"name": m.get("name"), "uid": uid, "version": sp.get("version"),
+                "type": pub.get("type"), "cloudType": sp.get("cloudType")}]))
+    packs = pub.get("packs") or []
+    prows = [{"name": pk.get("name"), "layer": pk.get("layer"), "tag": pk.get("tag"),
+              "registryUid": pk.get("registryUid") if a.full else trunc(pk.get("registryUid"), 12)}
+             for pk in packs]
+    emit(toon("layers", ["name", "layer", "tag", "registryUid"], prows),
+         f"\nlayerCount:{len(prows)}")
+
+
+def cmd_edgehosts(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_all("/v1/edgehosts", key, proj)
+    rows = []
+    for h in items:
+        m, st = dget(h, "metadata"), dget(h, "status")
+        # clusterUid does not exist on this resource (confirmed live) — the
+        # attachment lives in inUseClusters, a list because appliance-mode
+        # 2-node hosts can each show the same cluster.
+        in_use = st.get("inUseClusters") or []
+        cluster = ", ".join(c.get("name", "") for c in in_use)
+        rows.append({"name": m.get("name"), "uid": m.get("uid"), "state": st.get("state"),
+                     "health": dget(st, "health").get("state"), "cluster": cluster})
+    unhealthy = sum(1 for r in rows if is_unhealthy(r["health"]))
+    unassigned = sum(1 for r in rows if not r["cluster"])
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("edgehosts", ["name", "uid", "state", "health", "cluster"], rows),
+         f"\ncount:{len(rows)} unhealthy:{unhealthy} unassigned:{unassigned}" + truncation_note())
+
+
+def cmd_events(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = list_all("/v1/spectroclusters", key, proj)
+    hit = resolve_by_name(a.ref, items, "cluster")
+    uid = hit["metadata"]["uid"]
+    # /v1/spectroclusters/{uid}/events and /status/events both 404 in practice —
+    # confirmed by re-running the actual probe transcripts. The endpoint that
+    # works is under the events-components collection.
+    data = api("GET", f"/v1/events/components/spectrocluster/{uid}", key, proj, {"limit": a.limit})
+    items = data.get("items") or []
+    rows = []
+    for e in items:
+        sp, m = e.get("spec", e), dget(e, "metadata")
+        rows.append({"time": ts(m.get("creationTimestamp")), "severity": sp.get("severity"),
+                     "reason": sp.get("reason"), "message": sp.get("message") if a.full else trunc(sp.get("message"))})
+    warn = sum(1 for r in rows if r["severity"] in ("Warning", "Error"))
+    emit(f"tenant={a.tenant} project={proj} cluster={hit['metadata']['name']}",
+         toon("events", ["time", "severity", "reason", "message"], rows),
+         f"\ncount:{len(rows)} warnOrError:{warn}",
+         nxt(f"palette-axi events {a.ref} --project {proj} --full --limit 200") if not a.full else "")
+
+
+def cmd_packs(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    items = list_all("/v1/packs", key, proj, filters=f"metadata.name={a.name}", page_limit=50, max_pages=10)
+    active = [p for p in items if not dget(p, "status").get("disabled")]
+
+    def vkey(p):
+        parts = re.split(r"[.\-]", dget(p, "spec").get("version") or "0")
+        return tuple(int(x) if x.isdigit() else 0 for x in parts)
+
+    active.sort(key=vkey, reverse=True)
+    rows = active if a.full else active[:12]
+    trows = []
+    for i, p in enumerate(rows):
+        sp = dget(p, "spec")
+        trows.append({"version": sp.get("version"), "uid": p["metadata"]["uid"],
+                       "layer": sp.get("layer"), "registryUid": sp.get("registryUid"),
+                       "latest": i == 0})
+    hidden = len(active) - len(rows)
+    emit(f"tenant={a.tenant} pack={a.name}",
+         toon("versions", ["version", "uid", "layer", "registryUid", "latest"], trows),
+         f"\ntotalVersions:{len(active)} disabledSkipped:{len(items) - len(active)}"
+         + (f"  [+{hidden} more versions, --full]" if hidden > 0 else ""),
+         nxt(f"palette-axi packs {a.name} --full") if hidden > 0 else "")
+
+
+# ── cli ────────────────────────────────────────────────────────────────
+def main():
+    p = argparse.ArgumentParser(prog="palette-axi", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--tenant", default=DEFAULT_TENANT,
+                    help=f"1Password 'Palette API Key (<tenant>)' item to use (default: {DEFAULT_TENANT})")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("projects", help="list projects in the tenant")
+    s.set_defaults(fn=cmd_projects)
+
+    s = sub.add_parser("clusters", help="list clusters (state, health) in a project")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--edge", action="store_true", help="edge-native clusters only")
+    s.set_defaults(fn=cmd_clusters)
+
+    s = sub.add_parser("cluster", help="describe one cluster: state, health, pools, conditions")
+    s.add_argument("ref", help="cluster name or uid")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--full", action="store_true", help="show all conditions, not just non-True ones")
+    s.set_defaults(fn=cmd_cluster)
+
+    s = sub.add_parser("profiles", help="list cluster profiles in a project")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.set_defaults(fn=cmd_profiles)
+
+    s = sub.add_parser("profile", help="describe one cluster profile: layers/packs")
+    s.add_argument("ref", help="profile name or uid")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--full", action="store_true", help="untruncated registry uids")
+    s.set_defaults(fn=cmd_profile)
+
+    s = sub.add_parser("edgehosts", help="list edge hosts (state, health, cluster) in a project")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.set_defaults(fn=cmd_edgehosts)
+
+    s = sub.add_parser("events", help="recent events for a cluster (debugging)")
+    s.add_argument("ref", help="cluster name or uid")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--full", action="store_true", help="untruncated messages")
+    s.set_defaults(fn=cmd_events)
+
+    s = sub.add_parser("packs", help="search a pack by name across ALL versions (paginated)")
+    s.add_argument("name", help="pack metadata.name, e.g. edge-k3s, cni-calico")
+    s.add_argument("--project", help="project name or uid (optional; not required by /v1/packs)")
+    s.add_argument("--full", action="store_true", help="show every version, not just the newest 12")
+    s.set_defaults(fn=cmd_packs)
+
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        sys.exit(E_USAGE)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
