@@ -221,7 +221,8 @@ def api(method, path, api_key, project=None, params=None, json_body=None, timeou
         die(f"network error calling {path}: {e.reason}")
 
 
-def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=10):
+def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=10,
+             method="GET", json_body=None):
     """Page via listmeta.continue when the endpoint returns one — confirmed live
     that's the stable mechanism (packs, clusterprofiles). Raw offset increments
     are a fallback for endpoints that provide no continue token; some of those
@@ -241,7 +242,7 @@ def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages
         params["continue"] = cont if cont else None
         if not cont:
             params["offset"] = offset
-        data = api("GET", path, api_key, project, params)
+        data = api(method, path, api_key, project, params, json_body=json_body)
         if total is None:
             total = dget(data, "listmeta").get("count")
         batch = data.get("items") or []
@@ -320,13 +321,21 @@ def list_clusters(api_key, project, page_limit=50, max_pages=10):
 # old path capped at 50 while the tenant holds 65.
 PROJECTS_PATH = "/v1/dashboard/projects"
 
+# /v1/edgehosts answers the same 405 as /v1/projects did. The search endpoint is
+# POST-only but pages via the same listmeta.continue token, and returns the same
+# metadata/spec/status shape, so only the fetch changes.
+EDGEHOSTS_PATH = "/v1/dashboard/edgehosts/search"
+
 
 def _project_cluster_count(p):
-    """Running + healthy clusters. `spec.isDefault` was the third column until the
-    endpoint moved; /v1/dashboard/projects does not carry it, and a column that
-    reads False for all 65 projects is worse than no column."""
-    h = dget(dget(p, "status"), "clustersHealth")
-    return sum(v for v in h.values() if isinstance(v, int)) if h else 0
+    """How many clusters the project actually has.
+
+    `spec.isDefault` was the third column until the endpoint moved. The first cut
+    of the replacement summed status.clustersHealth — which is WRONG: its buckets
+    overlap, so a project with 4 running and 6 unhealthy has 6 clusters, not 10.
+    Measured live 9/8/26: 17 of the first 40 projects disagreed. status.usage.clusters
+    is one entry per cluster and matches what `palette-axi clusters` lists."""
+    return len(dget(dget(p, "status"), "usage").get("clusters") or [])
 
 
 def resolve_project(ref, api_key):
@@ -479,7 +488,8 @@ def cmd_profile(a):
 def cmd_edgehosts(a):
     key = get_api_key(a.tenant)
     proj = resolve_project(a.project, key)
-    items = list_all("/v1/edgehosts", key, proj)
+    items = list_all(EDGEHOSTS_PATH, key, proj,
+                     method="POST", json_body={"filter": {}, "sort": []})
     rows = []
     for h in items:
         m, st = dget(h, "metadata"), dget(h, "status")

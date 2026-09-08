@@ -132,6 +132,7 @@ class TestProjectsEndpoint(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
+        self.bodies = []
         self._api = palette_axi.api
         self._emit = palette_axi.emit
         # cmd_projects fetches the key before it ever calls api(), and that shells
@@ -144,10 +145,13 @@ class TestProjectsEndpoint(unittest.TestCase):
         def fake_api(method, path, api_key, project=None, params=None,
                      json_body=None, timeout=30):
             self.calls.append((method, path))
+            self.bodies.append(json_body)
             return {"items": [{"metadata": {"name": "Example-Project",
                                             "uid": "5f1e2d3c4b5a69780a1b2c3d"},
                                "status": {"clustersHealth": {"healthy": 2, "running": 1,
-                                                             "errored": 0, "unhealthy": 0}}}],
+                                                             "errored": 0, "unhealthy": 0},
+                                          "usage": {"clusters": [{"uid": "a"}, {"uid": "b"},
+                                                                 {"uid": "c"}]}}}],
                     "listmeta": {"count": 1}}
 
         palette_axi.api = fake_api
@@ -176,14 +180,14 @@ class TestProjectsEndpoint(unittest.TestCase):
 
     def test_cluster_count_replaces_the_column_that_no_longer_exists(self):
         """`spec.isDefault` is absent from the new payload. Reporting False for
-        every project would be a quiet lie, so the column carries real numbers."""
+        every project would be a quiet lie, so the column carries real numbers --
+        counted from status.usage.clusters, not by summing the overlapping health
+        buckets, which is what the first version of this test wrongly pinned.
+        See TestProjectClusterCount for that regression."""
         p = {"status": {"clustersHealth": {"healthy": 2, "running": 1,
-                                           "errored": 0, "unhealthy": 3}}}
-        self.assertEqual(palette_axi._project_cluster_count(p), 6)
-
-    def test_cluster_count_is_zero_not_a_crash_when_health_is_missing(self):
-        self.assertEqual(palette_axi._project_cluster_count({}), 0)
-        self.assertEqual(palette_axi._project_cluster_count({"status": None}), 0)
+                                           "errored": 0, "unhealthy": 3},
+                        "usage": {"clusters": [{"uid": "a"}, {"uid": "b"}]}}}
+        self.assertEqual(palette_axi._project_cluster_count(p), 2)
 
     def test_the_rendered_header_names_the_columns_it_actually_fills(self):
         """Live catch: the row dict moved to `clusters` while the TOON field list
@@ -198,3 +202,70 @@ class TestProjectsEndpoint(unittest.TestCase):
         self.assertIn("clusters", header)
         self.assertIn("Example-Project,5f1e2d3c4b5a69780a1b2c3d,3", block,
                       "cluster count did not render into the row")
+
+
+class TestEdgehostsEndpoint(unittest.TestCase):
+    """/v1/edgehosts answers the same 405 as /v1/projects did — found by smoke-testing
+    every verb live after the projects fix, rather than assuming one bug meant one
+    endpoint. The replacement is POST-only, so list_all had to learn a method."""
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._emit = palette_axi.api, palette_axi.emit
+        self._key, self._resolve = palette_axi.get_api_key, palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: "proj-uid"
+
+        def fake_api(method, path, api_key, project=None, params=None,
+                     json_body=None, timeout=30):
+            self.calls.append((method, path, json_body))
+            return {"items": [{"metadata": {"name": "edge-01", "uid": "u1"},
+                               "status": {"state": "ready", "health": {"state": "healthy"},
+                                          "inUseClusters": [{"name": "c1"}]}}],
+                    "listmeta": {"count": 1}}
+
+        palette_axi.api = fake_api
+        palette_axi.emit = lambda *a, **k: None
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.emit = self._api, self._emit
+        palette_axi.get_api_key, palette_axi.resolve_project = self._key, self._resolve
+
+    def test_edgehosts_does_not_call_the_retired_endpoint(self):
+        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p"})())
+        paths = [p for _, p, _ in self.calls]
+        self.assertTrue(paths, "cmd_edgehosts issued no request")
+        self.assertNotIn("/v1/edgehosts", paths, "still calling the 405 endpoint")
+        self.assertIn("/v1/dashboard/edgehosts/search", paths)
+
+    def test_it_posts_a_search_body(self):
+        """The search endpoint is POST-only; a GET returns 405 and a POST with no
+        body is not what the API accepts."""
+        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p"})())
+        method, _, body = self.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertIsNotNone(body, "no JSON body sent to a POST-only search endpoint")
+        self.assertIn("filter", body)
+
+
+class TestProjectClusterCount(unittest.TestCase):
+    """Regression on a bug this tool shipped: summing status.clustersHealth.
+
+    Its buckets overlap. Live on 9/8/26, CSE-Colton-Babcock reported
+    running=4 unhealthy=6 while holding 6 clusters, and 17 of the first 40
+    projects disagreed the same way. status.usage.clusters is one row per cluster.
+    """
+
+    def test_overlapping_health_buckets_are_not_summed(self):
+        p = {"status": {"clustersHealth": {"errored": 0, "healthy": 0,
+                                           "running": 4, "unhealthy": 6},
+                        "usage": {"clusters": [{"uid": "a"}, {"uid": "b"}, {"uid": "c"},
+                                               {"uid": "d"}, {"uid": "e"}, {"uid": "f"}]}}}
+        self.assertEqual(palette_axi._project_cluster_count(p), 6,
+                         "summed the overlapping health buckets again (would give 10)")
+
+    def test_zero_and_missing_are_zero_not_a_crash(self):
+        self.assertEqual(palette_axi._project_cluster_count({}), 0)
+        self.assertEqual(palette_axi._project_cluster_count({"status": None}), 0)
+        self.assertEqual(
+            palette_axi._project_cluster_count({"status": {"usage": {"clusters": None}}}), 0)
