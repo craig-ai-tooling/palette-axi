@@ -17,7 +17,7 @@ break on titles containing parentheses, so this tool never builds one.
 Default tenant is "custeng-prod"; override with --tenant or $PALETTE_AXI_TENANT.
 
 ProjectUid: most verbs need one. Pass --project by name or UID, or set
-$PALETTE_PROJECT. A name is resolved via GET /v1/projects (case-insensitive
+$PALETTE_PROJECT. A name is resolved via /v1/dashboard/projects (case-insensitive
 substring match); ambiguous or missing matches are a hard error listing the
 candidates — this tool never guesses which project you meant.
 
@@ -225,8 +225,8 @@ def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages
     """Page via listmeta.continue when the endpoint returns one — confirmed live
     that's the stable mechanism (packs, clusterprofiles). Raw offset increments
     are a fallback for endpoints that provide no continue token; some of those
-    genuinely don't honor offset at all (/v1/projects always returns the same
-    first 50 rows no matter what offset is sent) and others (edgehosts) return
+    genuinely don't honor offset at all (the retired /v1/projects always returned
+    the same first 50 rows whatever offset was sent) and others (edgehosts) return
     no listmeta whatsoever. Progress is tracked by uid so a page that adds
     nothing new ends the loop instead of spinning for max_pages.
 
@@ -272,8 +272,7 @@ def _set_truncated(got, total):
 
 
 def truncation_note():
-    # Confirmed live: /v1/projects ignores limit/offset entirely and caps at 50
-    # regardless of listmeta.count; /v1/clusterprofiles pages correctly via
+    # Confirmed live: /v1/clusterprofiles pages correctly via
     # listmeta.continue but still dropped 2 of 146 rows in the same test run —
     # this endpoint's own pagination is not fully reliable, not a bug in list_all.
     return (f"\nnote: API returned {LAST_LIST_GOT} of {LAST_LIST_TOTAL} "
@@ -315,13 +314,28 @@ def list_clusters(api_key, project, page_limit=50, max_pages=10):
 
 
 # ── project / resource resolution ───────────────────────────────────────
+# /v1/projects answered GET until it started returning
+# `405: method GET is not allowed, but [POST] are`. /v1/dashboard/projects serves
+# the same rows, pages honestly via listmeta.continue, and sees all of them: the
+# old path capped at 50 while the tenant holds 65.
+PROJECTS_PATH = "/v1/dashboard/projects"
+
+
+def _project_cluster_count(p):
+    """Running + healthy clusters. `spec.isDefault` was the third column until the
+    endpoint moved; /v1/dashboard/projects does not carry it, and a column that
+    reads False for all 65 projects is worse than no column."""
+    h = dget(dget(p, "status"), "clustersHealth")
+    return sum(v for v in h.values() if isinstance(v, int)) if h else 0
+
+
 def resolve_project(ref, api_key):
     ref = ref or os.environ.get("PALETTE_PROJECT")
     if not ref:
         die("no --project given (or set PALETTE_PROJECT). Run 'palette-axi projects' to list options.", E_USAGE)
     if UID_RE.match(ref):
         return ref
-    items = list_all("/v1/projects", api_key)
+    items = list_all(PROJECTS_PATH, api_key)
     exact = [p for p in items if (dget(p, "metadata").get("name") or "").lower() == ref.lower()]
     if exact:
         return exact[0]["metadata"]["uid"]
@@ -357,11 +371,11 @@ def resolve_by_name(ref, items, kind):
 # ── commands ───────────────────────────────────────────────────────────
 def cmd_projects(a):
     key = get_api_key(a.tenant)
-    items = list_all("/v1/projects", key)
+    items = list_all(PROJECTS_PATH, key)
     rows = [{"name": p["metadata"]["name"], "uid": p["metadata"]["uid"],
-             "default": dget(p, "spec").get("isDefault", False)} for p in items]
+             "clusters": _project_cluster_count(p)} for p in items]
     emit(f"tenant={a.tenant}",
-         toon("projects", ["name", "uid", "default"], rows),
+         toon("projects", ["name", "uid", "clusters"], rows),
          f"\ncount:{len(rows)}" + truncation_note(),
          nxt("palette-axi clusters --project <name>", "palette-axi edgehosts --project <name>"))
 

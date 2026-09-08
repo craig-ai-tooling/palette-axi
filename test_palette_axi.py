@@ -117,3 +117,84 @@ class TestResolveByName(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProjectsEndpoint(unittest.TestCase):
+    """The tenant's projects moved. `GET /v1/projects` began answering
+    `405: method GET is not allowed, but [POST] are`, which broke `projects` AND
+    every `--project <name>` lookup, since both resolved through it.
+
+    These drive the real code paths with `api()` stubbed, so they assert on the
+    request actually issued rather than on a string in the source. A test that
+    only grepped for the new path would pass while the verb still called the
+    dead one from a branch it never took.
+    """
+
+    def setUp(self):
+        self.calls = []
+        self._api = palette_axi.api
+        self._emit = palette_axi.emit
+        # cmd_projects fetches the key before it ever calls api(), and that shells
+        # out to `op`. Stubbing only api() left the suite green on a box that has
+        # 1Password installed and red on a runner that does not -- a test whose
+        # result depends on the machine is not a test.
+        self._key = palette_axi.get_api_key
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+
+        def fake_api(method, path, api_key, project=None, params=None,
+                     json_body=None, timeout=30):
+            self.calls.append((method, path))
+            return {"items": [{"metadata": {"name": "Example-Project",
+                                            "uid": "5f1e2d3c4b5a69780a1b2c3d"},
+                               "status": {"clustersHealth": {"healthy": 2, "running": 1,
+                                                             "errored": 0, "unhealthy": 0}}}],
+                    "listmeta": {"count": 1}}
+
+        palette_axi.api = fake_api
+        self.rendered = []
+        palette_axi.emit = lambda *a, **k: self.rendered.extend(
+            x for x in a if isinstance(x, str))
+
+    def tearDown(self):
+        palette_axi.api = self._api
+        palette_axi.emit = self._emit
+        palette_axi.get_api_key = self._key
+
+    def test_projects_does_not_call_the_retired_endpoint(self):
+        palette_axi.cmd_projects(type("A", (), {"tenant": "custeng-prod"})())
+        paths = [p for _, p in self.calls]
+        self.assertTrue(paths, "cmd_projects issued no request at all")
+        self.assertNotIn("/v1/projects", paths,
+                         "still calling the endpoint that answers 405")
+        self.assertIn("/v1/dashboard/projects", paths)
+
+    def test_resolving_a_project_by_name_uses_the_live_endpoint(self):
+        """The wider blast radius: every verb taking --project <name> goes here."""
+        uid = palette_axi.resolve_project("Example-Project", "key")
+        self.assertEqual(uid, "5f1e2d3c4b5a69780a1b2c3d")
+        self.assertNotIn("/v1/projects", [p for _, p in self.calls])
+
+    def test_cluster_count_replaces_the_column_that_no_longer_exists(self):
+        """`spec.isDefault` is absent from the new payload. Reporting False for
+        every project would be a quiet lie, so the column carries real numbers."""
+        p = {"status": {"clustersHealth": {"healthy": 2, "running": 1,
+                                           "errored": 0, "unhealthy": 3}}}
+        self.assertEqual(palette_axi._project_cluster_count(p), 6)
+
+    def test_cluster_count_is_zero_not_a_crash_when_health_is_missing(self):
+        self.assertEqual(palette_axi._project_cluster_count({}), 0)
+        self.assertEqual(palette_axi._project_cluster_count({"status": None}), 0)
+
+    def test_the_rendered_header_names_the_columns_it_actually_fills(self):
+        """Live catch: the row dict moved to `clusters` while the TOON field list
+        still said `default`, so the column rendered empty for all 65 projects --
+        a header promising a field the payload never carries. Stubbing emit and
+        checking only the request path missed it entirely."""
+        palette_axi.cmd_projects(type("A", (), {"tenant": "custeng-prod"})())
+        block = next((r for r in self.rendered if r.startswith("projects[")), None)
+        self.assertIsNotNone(block, "no projects TOON block was emitted")
+        header = block.splitlines()[0]
+        self.assertNotIn("default", header, "header still advertises the dead field")
+        self.assertIn("clusters", header)
+        self.assertIn("Example-Project,5f1e2d3c4b5a69780a1b2c3d,3", block,
+                      "cluster count did not render into the row")
