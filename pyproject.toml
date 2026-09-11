@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "palette-axi"
+version = "0.1.0"
+description = "Agent-ergonomic CLI over the Spectro Cloud Palette API."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []  # stdlib only — urllib, argparse, json, subprocess
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[project.scripts]
+palette-axi = "palette_axi.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["palette_axi"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E9 = syntax errors, F = pyflakes (unused imports/vars, undefined names).
+# The terse semicolon/one-line style is deliberate for a small CLI, so E7 is off.
+select = ["E9", "F"]

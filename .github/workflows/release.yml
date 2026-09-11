@@ -1,0 +1,44 @@
+name: Release
+
+# On a version tag, build the single-file zipapp and attach it to a GitHub Release.
+# Uses only the built-in Actions token + core release API — no GitHub Advanced
+# Security needed, so this works on a free private repo.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish palette-axi.pyz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build zipapp
+        run: make build
+
+      - name: Smoke-test the artifact
+        run: ./dist/palette-axi.pyz --help
+
+      - name: doctor smoke test (unconfigured runner is fine — must not fail the build)
+        run: ./dist/palette-axi.pyz doctor --json || true
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/palette-axi.pyz \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

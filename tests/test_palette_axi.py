@@ -4,18 +4,9 @@
 name/health helpers. Nothing here touches the network or 1Password — that's
 what "ACTUALLY RUN IT" in the build task covered, live, against custeng-prod.
 """
-import importlib.util
-import os
-import sys
 import unittest
-from importlib.machinery import SourceFileLoader
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-loader = SourceFileLoader("palette_axi", os.path.join(HERE, "palette-axi"))
-spec = importlib.util.spec_from_loader("palette_axi", loader)
-palette_axi = importlib.util.module_from_spec(spec)
-sys.modules["palette_axi"] = palette_axi
-loader.exec_module(palette_axi)
+from palette_axi import cli as palette_axi
 
 
 class TestTV(unittest.TestCase):

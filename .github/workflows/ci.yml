@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -18,15 +18,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Syntax check (palette-axi is stdlib-only, no install step needed)
-        run: python3 -m py_compile palette-axi
+      - name: Install (dev deps only — palette-axi itself is stdlib-only at runtime)
+        run: python3 -m pip install --upgrade pip && python3 -m pip install -e ".[dev]"
+
+      - name: Syntax check (palette-axi is stdlib-only, no runtime deps)
+        run: python3 -m compileall palette_axi
+
+      - name: Lint
+        run: ruff check .
 
       - name: Unit tests
-        run: python3 -m unittest test_palette_axi -v
+        run: python3 -m unittest discover -s tests -v
 
       - name: --help smoke test (no network, no credentials required)
         run: |
-          ./palette-axi --help
-          for verb in projects clusters cluster profiles profile edgehosts events packs; do
-            ./palette-axi "$verb" --help
+          python3 -m palette_axi --help
+          for verb in projects clusters cluster profiles profile edgehosts events packs doctor; do
+            python3 -m palette_axi "$verb" --help
           done

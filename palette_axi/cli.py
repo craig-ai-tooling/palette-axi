@@ -8,7 +8,9 @@ content-first output, and next-step disclosure.
 
 READ-ONLY. No verb in this tool creates, updates, deletes, or deploys
 anything against Palette. See README.md "Future work" for the write case
-that was deliberately left out.
+that was deliberately left out. `doctor` is the one exception to "no verb
+prints anything but data" in spirit only — it still never mutates Palette;
+it just probes whether the 1Password and Palette API connectors are usable.
 
 Auth: PALETTE_API_KEY env var wins if set. Otherwise the key is pulled from
 1Password (vault "Lobster", or $PALETTE_AXI_VAULT) by resolving the item
@@ -24,10 +26,14 @@ candidates — this tool never guesses which project you meant.
 Env overrides: PALETTE_API_KEY, PALETTE_PROJECT, PALETTE_AXI_TENANT,
 PALETTE_AXI_VAULT (default Lobster), PALETTE_AXI_OP_ITEM (skip tenant
 resolution and use this 1Password item id directly).
+
+Run `palette-axi doctor` to check whether those connectors are configured.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -50,7 +56,7 @@ UID_RE = re.compile(r"^[0-9a-f]{24}$")
 #   3 E_NOTFOUND  no such project/cluster/profile/edge host/pack
 #   4 E_REFUSED   refused on policy grounds (reserved — v1 has no write path
 #                 to refuse, kept for symmetry and for any future verb that
-#                 needs to say no rather than fail)
+#                 needs to say no)
 E_OK, E_ERR, E_USAGE, E_NOTFOUND, E_REFUSED = 0, 1, 2, 3, 4
 
 
@@ -556,6 +562,141 @@ def cmd_packs(a):
          nxt(f"palette-axi packs {a.name} --full") if hidden > 0 else "")
 
 
+# ── doctor ─────────────────────────────────────────────────────────────
+# One table, in code, of every connector this tool depends on. Each probe
+# function returns {"need": "required"|"optional", "status": "ok"|"down"|
+# "absent"|"skip", "detail": "..."} and must never raise — cmd_doctor also
+# wraps every call so a single broken probe can't take the whole command down.
+def _safe_call(fn, *args, **kwargs):
+    """Run one of the die()-based helpers above for a doctor probe, without
+    letting that helper's sys.exit() end the doctor process. die() prints
+    "error: <msg>" to stderr then exits; capture that instead of the exit.
+    Returns (result, None) on success or (None, message) on failure."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            return fn(*args, **kwargs), None
+    except SystemExit:
+        msg = buf.getvalue().strip()
+        if msg.startswith("error: "):
+            msg = msg[len("error: "):]
+        return None, msg or "failed (no error detail captured)"
+
+
+def _classify_op_failure(msg):
+    """'absent' means the dependency/resource simply isn't there (op missing,
+    no matching item) — anything else (auth, ambiguity, transport) is 'down'."""
+    lower = msg.lower()
+    if lower.startswith("not found on path") or "no 1password item" in lower:
+        return "absent"
+    return "down"
+
+
+def _probe_onepassword(tenant):
+    """Required unless PALETTE_API_KEY is set. Probes that `op` is on PATH
+    AND the tenant's item (or PALETTE_AXI_OP_ITEM, if set) actually resolves —
+    reuses the exact same helpers the real verbs use, so this can't drift from
+    what `get_api_key` will do."""
+    if os.environ.get("PALETTE_API_KEY"):
+        return {"need": "optional", "status": "skip",
+                "detail": "PALETTE_API_KEY is set — 1Password is not used"}
+
+    item_id = os.environ.get("PALETTE_AXI_OP_ITEM")
+    if item_id:
+        _, err = _safe_call(_op_secret_value, item_id)
+        if err:
+            return {"need": "required", "status": _classify_op_failure(err),
+                    "detail": f"{err} — check PALETTE_AXI_OP_ITEM={item_id}, "
+                              "or unset it to resolve by tenant instead"}
+        return {"need": "required", "status": "ok",
+                "detail": f"op on PATH — PALETTE_AXI_OP_ITEM={item_id} resolves in vault {OP_VAULT}"}
+
+    _, err = _safe_call(_op_item_id_for_tenant, tenant)
+    if err:
+        return {"need": "required", "status": _classify_op_failure(err),
+                "detail": f"{err} — fix: run `op signin`, set PALETTE_AXI_OP_ITEM=<id>, "
+                          "or set PALETTE_API_KEY"}
+    return {"need": "required", "status": "ok",
+            "detail": f"op on PATH — item 'Palette API Key ({tenant})' in vault {OP_VAULT}"}
+
+
+def _probe_palette_api(tenant):
+    """Required. Probe = a cheap authenticated read on the same endpoint the
+    `projects` verb already uses (limit=1), via the same api()/get_api_key()
+    code path — this can't call a different endpoint than the real verbs do."""
+    key, err = _safe_call(get_api_key, tenant)
+    if err:
+        return {"need": "required", "status": "down",
+                "detail": f"no API key available: {err} — set PALETTE_API_KEY, "
+                          "or fix 1Password (see the onepassword row)"}
+    _, err = _safe_call(api, "GET", PROJECTS_PATH, key, None, {"limit": 1})
+    if err:
+        return {"need": "required", "status": "down",
+                "detail": f"{err} — check PALETTE_API_KEY / the 1Password item value, "
+                          f"or network access to {API_BASE}"}
+    return {"need": "required", "status": "ok",
+            "detail": f"GET {PROJECTS_PATH} succeeded — key accepted"}
+
+
+# name -> probe(tenant). Add a new connector here and doctor picks it up.
+DOCTOR_CONNECTORS = [
+    ("onepassword", _probe_onepassword),
+    ("palette-api", _probe_palette_api),
+]
+
+
+def _config_rows(tenant):
+    """The env vars this tool reads, their effective value, and where that
+    value came from — never the API key's actual value."""
+    def row(var, value, source):
+        return {"var": var, "value": value, "source": source}
+
+    rows = []
+
+    env_key = os.environ.get("PALETTE_API_KEY")
+    rows.append(row("PALETTE_API_KEY", "set" if env_key else "unset", "env" if env_key else "unset"))
+
+    proj = os.environ.get("PALETTE_PROJECT")
+    rows.append(row("PALETTE_PROJECT", proj or "", "env" if proj else "unset"))
+
+    tenant_flag = any(arg == "--tenant" or arg.startswith("--tenant=") for arg in sys.argv[1:])
+    tenant_env = os.environ.get("PALETTE_AXI_TENANT")
+    rows.append(row("PALETTE_AXI_TENANT", tenant,
+                     "flag" if tenant_flag else ("env" if tenant_env else "default")))
+
+    vault_env = os.environ.get("PALETTE_AXI_VAULT")
+    rows.append(row("PALETTE_AXI_VAULT", OP_VAULT, "env" if vault_env else "default"))
+
+    op_item = os.environ.get("PALETTE_AXI_OP_ITEM")
+    rows.append(row("PALETTE_AXI_OP_ITEM", op_item or "", "env" if op_item else "unset"))
+
+    return rows
+
+
+def cmd_doctor(a):
+    tenant = a.tenant
+    connectors = []
+    for name, probe in DOCTOR_CONNECTORS:
+        try:
+            result = probe(tenant)
+        except Exception as e:  # a probe must never take the whole command down
+            result = {"need": "required", "status": "down", "detail": f"probe crashed: {e}"}
+        row = {"name": name}
+        row.update(result)
+        connectors.append(row)
+
+    config = _config_rows(tenant)
+    required_bad = [c for c in connectors if c["need"] == "required" and c["status"] != "ok"]
+
+    if a.json:
+        print(json.dumps({"connectors": connectors, "config": config}, indent=2))
+    else:
+        emit(toon("connectors", ["name", "need", "status", "detail"], connectors),
+             toon("config", ["var", "value", "source"], config))
+
+    sys.exit(E_ERR if required_bad else E_OK)
+
+
 # ── cli ────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(prog="palette-axi", description=__doc__.split("\n")[0],
@@ -605,17 +746,21 @@ def main():
     s.add_argument("--full", action="store_true", help="show every version, not just the newest 12")
     s.set_defaults(fn=cmd_packs)
 
+    s = sub.add_parser("doctor", help="check whether 1Password and the Palette API are usable")
+    s.add_argument("--json", action="store_true", help="emit JSON instead of TOON")
+    s.set_defaults(fn=cmd_doctor)
+
     a = p.parse_args()
     if not a.cmd:
         p.print_help()
         sys.exit(E_USAGE)
-    a.fn(a)
-
-
-if __name__ == "__main__":
     try:
-        main()
+        a.fn(a)
     except KeyboardInterrupt:
         sys.exit(130)
     except BrokenPipeError:
         sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -19,20 +19,49 @@ deliberately left out.
 
 ## Install
 
-Nothing to install — stdlib-only Python 3, same dependency posture as
-`opp-axi`. Put `palette-axi` on your `PATH` or call it by path.
+This repo is **private** — there is no public release URL to `curl`. Install via the
+GitHub CLI instead, either directly:
 
+```sh
+gh release download --repo craig-ai-tooling/palette-axi \
+  --pattern 'palette-axi.pyz' --output ~/.local/bin/palette-axi --clobber
+chmod +x ~/.local/bin/palette-axi
 ```
+
+or with the bundled installer (same steps, honours `$BIN` for the target path; requires
+`gh` authenticated with access to this private repo — `gh auth status`):
+
+```sh
+./scripts/install.sh
+```
+
+`palette-axi.pyz` is a zipapp — it needs a Python 3.10+ interpreter on the target (every
+lab box has one), not a compiled binary.
+
+### From source
+
+```sh
 git clone <this repo>
-./palette-axi projects
+python3 -m palette_axi --help     # run straight from a checkout, or:
+make build                        # writes dist/palette-axi.pyz
 ```
 
-## Auth
+## Configure
 
 1. `PALETTE_API_KEY` env var wins if set — skips 1Password entirely.
 2. Otherwise the key comes from 1Password, vault `Lobster` (or
    `$PALETTE_AXI_VAULT`), tenant `custeng-prod` by default (or `--tenant NAME`
    / `$PALETTE_AXI_TENANT`).
+
+| Env | Default | Required? |
+|---|---|---|
+| `PALETTE_API_KEY` | (none) | No — skips 1Password entirely when set |
+| `PALETTE_AXI_TENANT` | `custeng-prod` | No |
+| `PALETTE_AXI_VAULT` | `Lobster` | No |
+| `PALETTE_AXI_OP_ITEM` | (none) | No — skips tenant→item-id lookup when set |
+| `PALETTE_PROJECT` | (none) | No — most verbs also accept `--project` |
+
+`palette-axi doctor` tells you what is still missing.
 
 ### The op item-ID gotcha
 
@@ -93,6 +122,7 @@ palette-axi packs cni-calico --full                        # every version, not 
 | `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. |
 | `events` | `GET /v1/events/components/spectrocluster/{uid}` | **Not** `/v1/spectroclusters/{uid}/events` or `.../status/events` — both of those 404 or 422 in practice. A real session in the transcripts probed six candidate endpoints live and found this one; that probe's exact result is what this verb uses. |
 | `packs` | `GET /v1/packs?filters=metadata.name=...` (fully paginated) | 127 direct refs, called out as "MANDATORY"/"CRITICAL" pagination in three separate skills because the endpoint silently caps at 50 results per page. This verb pages it exhaustively and returns versions newest-first with the true latest marked, instead of every session re-deriving the same offset-loop-plus-sort `jq` pipeline by hand. |
+| `doctor` | Same read the `projects` verb uses, `limit=1` | Not a Palette data verb — checks whether 1Password and the Palette API are actually usable before you run one of the above. See [Configure](#configure). |
 
 Registries and full profile/cluster **create-or-update** flows were left out
 even though they're heavily referenced (pack registry endpoints alone: 51
@@ -165,3 +195,18 @@ uses for teardown flows.
 **`registries`** — `GET /v1/registries/pack` and `/v1/registries/helm`
 (51 combined transcript refs). Left out because it's almost always a step
 inside a profile-authoring flow, which is write-adjacent and out of v1 scope.
+
+## Develop
+
+```sh
+python3 -m unittest discover -s tests   # tests (offline; network is stubbed)
+ruff check .                            # lint
+python3 -m compileall palette_axi       # compile check
+make build                              # dist/palette-axi.pyz
+```
+
+A `v*` tag builds the `.pyz` and publishes it to a GitHub Release via
+`.github/workflows/release.yml` — that release is what [Install](#install) pulls.
+
+See [AGENTS.md](AGENTS.md) for the full contract, including the **no-mistakes**
+mode this repo runs in.
