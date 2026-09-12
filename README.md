@@ -19,21 +19,24 @@ deliberately left out.
 
 ## Install
 
-This repo is **private** — there is no public release URL to `curl`. Install via the
-GitHub CLI instead, either directly:
+The release artifact is a single-file zipapp. It needs `python3 >= 3.10` on the
+target; it is not a static binary.
 
 ```sh
-gh release download --repo craig-ai-tooling/palette-axi \
-  --pattern 'palette-axi.pyz' --output ~/.local/bin/palette-axi --clobber
+curl -fsSL https://raw.githubusercontent.com/craig-ai-tooling/palette-axi/main/scripts/install.sh | bash
+```
+
+or by hand:
+
+```sh
+curl -fsSL https://github.com/craig-ai-tooling/palette-axi/releases/latest/download/palette-axi.pyz \
+  -o ~/.local/bin/palette-axi
 chmod +x ~/.local/bin/palette-axi
 ```
 
-or with the bundled installer (same steps, honours `$BIN` for the target path; requires
-`gh` authenticated with access to this private repo — `gh auth status`):
+The bundled installer honours `$BIN` for the target path.
 
-```sh
-./scripts/install.sh
-```
+Then: `palette-axi doctor` — it says exactly what still needs configuring.
 
 `palette-axi.pyz` is a zipapp — it needs a Python 3.10+ interpreter on the target (every
 lab box has one), not a compiled binary.

@@ -33,7 +33,7 @@ same packaging standard.
 | `palette_axi/` | Application code (`cli.py` has everything; `__init__.py` holds `__version__`) |
 | `tests/` | Offline unit tests — no network, no 1Password |
 | `.github/workflows/` | CI (`ci.yml`) + release (`release.yml`, fires on a `v*` tag) |
-| `scripts/install.sh` | Installs the released `.pyz` via `gh release download` (private repo — no public URL) |
+| `scripts/install.sh` | Installs the released `.pyz` by curling the public release asset |
 
 ---
 
