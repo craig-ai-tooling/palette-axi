@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# Install the latest palette-axi single-file build onto your PATH.
+# Install the latest palette-axi release.
 #
-# This repo is PRIVATE — there is no public release URL to `curl`, so this
-# pulls the .pyz via the GitHub CLI instead. Needs `gh` authenticated with
-# access to craig-ai-tooling/palette-axi (`gh auth status`), and a Python
-# 3.10+ interpreter on the target (every lab box has one).
-#
-#   ./scripts/install.sh
-#   BIN=/usr/local/bin/palette-axi ./scripts/install.sh   # custom target
+# The artifact is a zipapp, not a static binary: it needs python3 >= 3.10 on the
+# target machine.
 set -euo pipefail
 
 REPO="craig-ai-tooling/palette-axi"
 BIN="${BIN:-$HOME/.local/bin/palette-axi}"
+URL="https://github.com/${REPO}/releases/latest/download/palette-axi.pyz"
 
-if ! command -v gh >/dev/null 2>&1; then
-  echo "error: gh (GitHub CLI) is required — this is a private repo, so there is" >&2
-  echo "       no public release URL to curl. Install gh and run 'gh auth login'." >&2
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "need python3 >= 3.10 on PATH — the artifact is a zipapp, not a static binary" >&2
   exit 1
 fi
 
 mkdir -p "$(dirname "$BIN")"
-gh release download --repo "$REPO" --pattern 'palette-axi.pyz' --output "$BIN" --clobber
+curl -fsSL "$URL" -o "$BIN"
 chmod +x "$BIN"
 "$BIN" --help >/dev/null
+
 echo "installed $BIN"
-echo "next: $BIN doctor"
+echo
+echo "next: $BIN doctor    # says exactly what still needs configuring"
