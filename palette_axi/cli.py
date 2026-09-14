@@ -513,6 +513,82 @@ def cmd_edgehosts(a):
          f"\ncount:{len(rows)} unhealthy:{unhealthy} unassigned:{unassigned}" + truncation_note())
 
 
+def _pcg(item):
+    """overlordUid is the PCG uid on a private-cloud account and "" on a
+    public-cloud one (all 20 custeng-prod accounts carried the key, 9/14/26).
+    If a future row omits it, that is unknown, not "no PCG" — per _tv's
+    contract None and False are different facts."""
+    ann = dget(dget(item, "metadata"), "annotations")
+    if "overlordUid" not in ann:
+        return None
+    return bool(ann.get("overlordUid"))
+
+
+# Evidence probed 9/14/26 against custeng-prod, why this verb is
+# summary-only and filters client-side:
+#   - GET /v1/cloudaccounts/summary returns every cloud kind in one call;
+#     its specSummary is EMPTY — no credentials in this response.
+#   - The per-cloud endpoints (GET /v1/cloudaccounts/{aws,azure,gcp,vsphere,
+#     maas}) return spec.secretKey / spec.secretToken / spec.sts.externalId —
+#     actual credentials — so this verb never calls a per-cloud endpoint.
+#   - GET /v1/cloudaccounts/openstack 404s even though summary lists
+#     openstack accounts, so a per-cloud endpoint isn't even a viable
+#     alternative for every kind — summary is the only one that works for all.
+#   - Summary IGNORES cloudType=<x> (returns all rows) and
+#     filters=spec.cloudType=<x> (returns zero rows) — so --cloud filters
+#     client-side on `kind` and list_all is called with no `filters` at all.
+#   - ProjectUid changes SCOPE, not row shape: without it, only tenant-owned
+#     accounts come back; with it, the project's own account(s) plus tenant
+#     accounts shared into it — some tenant accounts (scopeVisibility "4")
+#     never appear in project scope.
+def cmd_cloudaccounts(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    items = list_all("/v1/cloudaccounts/summary", key, proj)
+
+    # Unfiltered per-cloud counts, so `--cloud gcp` finding nothing still
+    # shows what clouds actually exist instead of a bare "(none)".
+    clouds = {}
+    for it in items:
+        k = it.get("kind") or ""
+        clouds[k] = clouds.get(k, 0) + 1
+    clouds_summary = " ".join(f"{k}={clouds[k]}" for k in sorted(clouds))
+
+    show = items
+    if a.cloud:
+        show = [it for it in items if (it.get("kind") or "").lower() == a.cloud.lower()]
+
+    rows = []
+    for it in show:
+        m = dget(it, "metadata")
+        ann = dget(m, "annotations")
+        rows.append({"name": m.get("name"), "uid": m.get("uid"), "cloud": it.get("kind"),
+                     "scope": ann.get("scope"), "pcg": _pcg(it),
+                     "created": ts(m.get("creationTimestamp"))})
+    rows.sort(key=lambda r: (r["cloud"] or "", r["name"] or ""))
+
+    project_scoped = sum(1 for r in rows if r["scope"] == "project")
+    tenant_scoped = sum(1 for r in rows if r["scope"] == "tenant")
+
+    if proj:
+        header = f"tenant={a.tenant} scope=project project={proj}"
+        note = ("note: project scope lists this project's own accounts plus "
+                 "tenant accounts shared with it")
+        next_line = nxt(f"palette-axi clusters --project {proj}")
+    else:
+        header = f"tenant={a.tenant} scope=tenant"
+        note = ("note: tenant scope lists tenant-owned accounts only; "
+                 "project-owned accounts appear only with --project")
+        next_line = nxt("palette-axi cloudaccounts --project <name>")
+
+    emit(header,
+         toon("cloudaccounts", ["name", "uid", "cloud", "scope", "pcg", "created"], rows),
+         f"\ncount:{len(rows)} projectScoped:{project_scoped} tenantScoped:{tenant_scoped}\n"
+         f"clouds: {clouds_summary}" + truncation_note(),
+         note,
+         next_line)
+
+
 def cmd_events(a):
     key = get_api_key(a.tenant)
     proj = resolve_project(a.project, key)
@@ -732,6 +808,12 @@ def main():
     s = sub.add_parser("edgehosts", help="list edge hosts (state, health, cluster) in a project")
     s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
     s.set_defaults(fn=cmd_edgehosts)
+
+    s = sub.add_parser("cloudaccounts",
+                        help="list cloud accounts (aws, azure, vsphere, maas, ...) visible at tenant or project scope")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--cloud", help="filter by cloud kind (aws, azure, gcp, vsphere, maas, openstack, ...), case-insensitive")
+    s.set_defaults(fn=cmd_cloudaccounts)
 
     s = sub.add_parser("events", help="recent events for a cluster (debugging)")
     s.add_argument("ref", help="cluster name or uid")

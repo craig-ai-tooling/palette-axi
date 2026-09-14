@@ -4,6 +4,10 @@
 name/health helpers. Nothing here touches the network or 1Password — that's
 what "ACTUALLY RUN IT" in the build task covered, live, against custeng-prod.
 """
+import argparse
+import contextlib
+import io
+import sys
 import unittest
 
 from palette_axi import cli as palette_axi
@@ -260,3 +264,144 @@ class TestProjectClusterCount(unittest.TestCase):
         self.assertEqual(palette_axi._project_cluster_count({"status": None}), 0)
         self.assertEqual(
             palette_axi._project_cluster_count({"status": {"usage": {"clusters": None}}}), 0)
+
+
+class TestCloudAccounts(unittest.TestCase):
+    """cloudaccounts: GET /v1/cloudaccounts/summary only. See the why-comment
+    above cmd_cloudaccounts in cli.py for the live evidence this pins down —
+    secrets live only in the per-cloud endpoints' spec, /v1/cloudaccounts/
+    openstack 404s, cloudType/filters query params are silently ignored by
+    summary, and ProjectUid changes scope rather than filtering rows."""
+
+    ITEMS = [
+        {"kind": "aws", "metadata": {"name": "aws-tenant", "uid": "u-aws-1",
+                                      "creationTimestamp": "2026-01-02T03:04:05Z",
+                                      "annotations": {"scope": "tenant", "overlordUid": ""}},
+         "specSummary": {}, "status": {}},
+        {"kind": "azure", "metadata": {"name": "azure-tenant", "uid": "u-azure-1",
+                                        "creationTimestamp": "2026-01-03T03:04:05Z",
+                                        "annotations": {"scope": "tenant"}},
+         "specSummary": {}, "status": {}},
+        {"kind": "vsphere", "metadata": {"name": "vsphere-proj", "uid": "u-vsphere-1",
+                                          "creationTimestamp": "2026-01-04T03:04:05Z",
+                                          "annotations": {"scope": "project",
+                                                           "projectUid": "6720c668e9746cb63a499425",
+                                                           "overlordUid": "pcg-uid-123"}},
+         "specSummary": {}, "status": {}},
+    ]
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project,
+                                "params": dict(params or {})})
+            return {"items": [dict(i) for i in self.ITEMS], "listmeta": {"count": len(self.ITEMS)}}
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+
+    def _run(self, project=None, cloud=None):
+        args = type("A", (), {"tenant": "custeng-prod", "project": project, "cloud": cloud})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_cloudaccounts(args)
+        return buf.getvalue()
+
+    def test_tenant_scope_hits_summary_only_no_project_no_filters(self):
+        out = self._run()
+        self.assertEqual(len(self.calls), 1, "expected exactly one request (summary is a single call)")
+        call = self.calls[0]
+        self.assertEqual(call["path"], "/v1/cloudaccounts/summary")
+        self.assertIsNone(call["project"], "tenant scope must not pass a ProjectUid")
+        self.assertIsNone(call["params"].get("filters"), "summary ignores filters live -- never send one")
+        self.assertIn("scope=tenant", out)
+        self.assertIn("cloudaccounts[3]", out)
+        self.assertIn("count:3 projectScoped:1 tenantScoped:2", out)
+        self.assertIn("clouds: aws=1 azure=1 vsphere=1", out)
+
+    def test_project_scope_passes_projectuid_through(self):
+        uid = "6720c668e9746cb63a499425"  # real Palette-shaped uid: 24 hex chars
+        out = self._run(project=uid)
+        self.assertEqual(self.calls[0]["project"], uid)
+        self.assertIn(f"scope=project project={uid}", out)
+
+    def test_cloud_filter_case_insensitive(self):
+        out = self._run(cloud="AWS")
+        self.assertIn("cloudaccounts[1]", out)
+        self.assertIn("aws-tenant", out)
+        self.assertNotIn("azure-tenant", out)
+
+    def test_cloud_filter_no_match_still_shows_unfiltered_clouds(self):
+        out = self._run(cloud="gcp")
+        self.assertIn("cloudaccounts[0]{name,uid,cloud,scope,pcg,created}: (none)", out)
+        self.assertIn("clouds: aws=1 azure=1 vsphere=1", out)
+
+    def test_pcg_true_false_and_absent_stay_distinct(self):
+        out = self._run()
+        rows = {ln.strip().split(",")[0]: ln.strip() for ln in out.splitlines()
+                if ln.strip().split(",")[0] in ("aws-tenant", "azure-tenant", "vsphere-proj")}
+        self.assertEqual(len(rows), 3, "expected all three fixture rows rendered")
+        self.assertIn(",false,", rows["aws-tenant"], "overlordUid '' -> known-false")
+        self.assertIn(",,", rows["azure-tenant"], "overlordUid absent -> empty/unknown cell")
+        self.assertIn(",true,", rows["vsphere-proj"], "overlordUid set -> known-true")
+
+    def test_secret_fields_never_reach_stdout(self):
+        """specSummary is documented empty, but guard against a future response
+        shape carrying spec.secretKey/secretToken the way the per-cloud
+        endpoints do -- this verb must never print one."""
+        leaky = [dict(i, spec={"secretKey": "SEKRIT-abc", "secretToken": "SEKRIT-def"})
+                 for i in self.ITEMS]
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            return {"items": leaky, "listmeta": {"count": len(leaky)}}
+
+        palette_axi.api = fake_api
+        out = self._run()
+        self.assertNotIn("SEKRIT", out)
+
+
+class TestHelpForEverySubcommand(unittest.TestCase):
+    """CI's own --help smoke loop lives in .github/workflows/ci.yml, a
+    protected path this change does not touch, so it never learns about a
+    new verb on its own. This offline test iterates the real subparser
+    choices instead, so adding a verb without wiring its --help is caught
+    here rather than only live."""
+
+    def test_every_verb_help_exits_zero(self):
+        real_add_subparsers = argparse.ArgumentParser.add_subparsers
+        captured = {}
+
+        def spy(self, *a, **k):
+            action = real_add_subparsers(self, *a, **k)
+            captured["action"] = action
+            return action
+
+        argparse.ArgumentParser.add_subparsers = spy
+        old_argv = sys.argv
+        try:
+            sys.argv = ["palette-axi", "--help"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    palette_axi.main()
+        finally:
+            argparse.ArgumentParser.add_subparsers = real_add_subparsers
+            sys.argv = old_argv
+
+        verbs = sorted(captured["action"].choices)
+        self.assertIn("cloudaccounts", verbs, "the new verb must be registered")
+
+        for verb in verbs:
+            with self.subTest(verb=verb):
+                sys.argv = ["palette-axi", verb, "--help"]
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as ctx:
+                            palette_axi.main()
+                    self.assertEqual(ctx.exception.code, 0)
+                finally:
+                    sys.argv = old_argv

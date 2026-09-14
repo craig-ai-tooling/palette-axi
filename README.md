@@ -108,6 +108,7 @@ palette-axi cluster rpi-inference --project SA-Craig-Smith --full   # all condit
 palette-axi profiles --project SA-Craig-Smith
 palette-axi profile craig-nvidia --project SA-Craig-Smith
 palette-axi edgehosts --project SA-Craig-Smith
+palette-axi cloudaccounts --project SA-Craig-Smith --cloud aws  # cloud accounts visible to that project
 palette-axi events rpi-inference --project SA-Craig-Smith --limit 100
 palette-axi packs edge-k3s                                # tenant-wide, no --project needed
 palette-axi packs cni-calico --full                        # every version, not just newest 12
@@ -123,6 +124,7 @@ palette-axi packs cni-calico --full                        # every version, not 
 | `profiles` | `GET /v1/clusterprofiles` | 111+ direct refs; profile discovery precedes almost every profile-editing session. |
 | `profile` | `GET /v1/clusterprofiles/{uid}` | Layer/pack shape (`spec.published.packs[].tag`) confirmed against a real transcript that was diffing two profile versions. |
 | `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. |
+| `cloudaccounts` | `GET /v1/cloudaccounts/summary` | Lists every cloud type (aws, azure, gcp, vsphere, maas, openstack, ...) in one call. Never hits a per-cloud endpoint — see [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below for why. |
 | `events` | `GET /v1/events/components/spectrocluster/{uid}` | **Not** `/v1/spectroclusters/{uid}/events` or `.../status/events` — both of those 404 or 422 in practice. A real session in the transcripts probed six candidate endpoints live and found this one; that probe's exact result is what this verb uses. |
 | `packs` | `GET /v1/packs?filters=metadata.name=...` (fully paginated) | 127 direct refs, called out as "MANDATORY"/"CRITICAL" pagination in three separate skills because the endpoint silently caps at 50 results per page. This verb pages it exhaustively and returns versions newest-first with the true latest marked, instead of every session re-deriving the same offset-loop-plus-sort `jq` pipeline by hand. |
 | `doctor` | Same read the `projects` verb uses, `limit=1` | Not a Palette data verb — checks whether 1Password and the Palette API are actually usable before you run one of the above. See [Configure](#configure). |
@@ -155,6 +157,27 @@ skills:
   convention on two sibling endpoints.
 - **Edge host cluster attachment lives in `status.inUseClusters[]`**, not a
   `clusterUid` field (that field does not exist on this resource).
+- **(9/14/26) `GET /v1/cloudaccounts/summary` returns every cloud type in one
+  call** (`kind`: `aws`, `azure`, `gcp`, `vsphere`, `maas`, `openstack`, ...)
+  and its `specSummary` is **empty — no credentials**. The per-cloud
+  endpoints (`GET /v1/cloudaccounts/{aws,azure,gcp,vsphere,maas}`) return
+  `spec.secretKey` / `spec.secretToken` / `spec.sts.externalId` — real
+  credentials — so `cloudaccounts` never calls one of those.
+- **(9/14/26) `GET /v1/cloudaccounts/openstack` 404s**, even though the
+  summary endpoint lists openstack accounts fine — there is no working
+  per-cloud endpoint for every kind summary reports, another reason to stay
+  on summary-only.
+- **(9/14/26) Summary ignores query-param filtering entirely.**
+  `cloudType=aws` is silently ignored (still returns all 20 rows in a
+  20-account tenant) and `filters=spec.cloudType=aws` returns **zero** rows.
+  `cloudaccounts --cloud` filters client-side on `kind` instead of trusting
+  either query param.
+- **(9/14/26) `ProjectUid` changes scope, not row shape.** Without it,
+  `/v1/cloudaccounts/summary` returns only tenant-owned accounts (20 in
+  `custeng-prod`); with a `ProjectUid` header it returns that project's own
+  account(s) plus the tenant accounts shared into it (14 rows for one
+  project tested) — some tenant accounts (`scopeVisibility "4"`) never show
+  up in project scope at all.
 
 Every list verb that can detect this (via `listmeta.count`) prints a `note:`
 line naming exactly how many rows it got vs. how many the API claims exist,
