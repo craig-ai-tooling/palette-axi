@@ -109,9 +109,13 @@ palette-axi profiles --project SA-Craig-Smith
 palette-axi profile craig-nvidia --project SA-Craig-Smith
 palette-axi edgehosts --project SA-Craig-Smith
 palette-axi cloudaccounts --project SA-Craig-Smith --cloud aws  # cloud accounts visible to that project
+palette-axi cloudconfig rpi-inference --project SA-Craig-Smith # cluster's cloud config + machine pools
 palette-axi events rpi-inference --project SA-Craig-Smith --limit 100
 palette-axi packs edge-k3s                                # tenant-wide, no --project needed
 palette-axi packs cni-calico --full                        # every version, not just newest 12
+palette-axi registries                                    # all pack/helm/oci registries, tenant-wide
+palette-axi registries --kind oci                          # one kind only
+palette-axi registries "Public Repo"                       # describe one by name or uid
 ```
 
 ## Verbs and the evidence behind each
@@ -125,15 +129,16 @@ palette-axi packs cni-calico --full                        # every version, not 
 | `profile` | `GET /v1/clusterprofiles/{uid}` | Layer/pack shape (`spec.published.packs[].tag`) confirmed against a real transcript that was diffing two profile versions. |
 | `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. |
 | `cloudaccounts` | `GET /v1/cloudaccounts/summary` | Lists every cloud type (aws, azure, gcp, vsphere, maas, openstack, ...) in one call. Never hits a per-cloud endpoint — see [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below for why. |
+| `cloudconfig` | `GET /v1/spectroclusters/{uid}` + `GET /v1/cloudconfigs/{kind}/{uid}` | 23 combined transcript refs, 13.0% failing, zero prior coverage. A cluster's `spec.cloudConfigRef` names the exact `{kind, uid}` to GET next — there is no tenant-wide cloudconfig list, so the cluster is the index. Read-only: the write calls this scout doc also saw (`PUT clusterConfig`, `PUT machinePools/...`) are deliberately out of scope. |
 | `events` | `GET /v1/events/components/spectrocluster/{uid}` | **Not** `/v1/spectroclusters/{uid}/events` or `.../status/events` — both of those 404 or 422 in practice. A real session in the transcripts probed six candidate endpoints live and found this one; that probe's exact result is what this verb uses. |
 | `packs` | `GET /v1/packs?filters=metadata.name=...` (fully paginated) | 127 direct refs, called out as "MANDATORY"/"CRITICAL" pagination in three separate skills because the endpoint silently caps at 50 results per page. This verb pages it exhaustively and returns versions newest-first with the true latest marked, instead of every session re-deriving the same offset-loop-plus-sort `jq` pipeline by hand. |
+| `registries` | `GET /v1/registries/metadata` (list) + `GET /v1/registries/{pack,helm,oci}/{uid}` (describe) | 43 combined transcript refs, 30.2% failing — the worst fail rate of any bucket with double-digit volume, and zero prior coverage. `metadata` is the one endpoint that actually lists all three kinds; `GET /v1/registries/oci` itself 405s (`Allow: DELETE`). See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `doctor` | Same read the `projects` verb uses, `limit=1` | Not a Palette data verb — checks whether 1Password and the Palette API are actually usable before you run one of the above. See [Configure](#configure). |
 
-Registries and full profile/cluster **create-or-update** flows were left out
-even though they're heavily referenced (pack registry endpoints alone: 51
-refs) — the task scope is the verbs actually used for **inspection**, and
-those two are almost always steps inside a write workflow (build a profile,
-then create a cluster), which is out of scope for v1.
+Full profile/cluster/cloudconfig **create-or-update** flows were left out —
+the task scope is the verbs actually used for **inspection**; write flows
+(build a profile, then create a cluster, then tune its cloud config) are
+explicitly out of scope for v1.
 
 ## Real API behavior discovered while building this (not documented anywhere)
 
@@ -178,6 +183,43 @@ skills:
   account(s) plus the tenant accounts shared into it (14 rows for one
   project tested) — some tenant accounts (`scopeVisibility "4"`) never show
   up in project scope at all.
+- **(9/15/26) `GET /v1/registries/oci` 405s** (`Allow: DELETE`) — there is no
+  working GET list endpoint for oci registries at all, unlike pack and helm.
+  `GET /v1/registries/metadata` is the one endpoint that lists all three
+  kinds (105 rows in `custeng-prod`: 7 pack, 75 helm, 23 oci) in a single
+  unpaginated call, and it silently ignores both `kind=` and `limit=` query
+  params — confirmed by requesting `limit=5` and `kind=oci` and getting all
+  105 rows back either way. Its per-kind subtotal matches `list_all`'s own
+  `listmeta.count` exactly for pack and helm, the two kinds with an
+  independent paginated endpoint to check it against.
+- **(9/15/26) `GET /v1/registries/oci/{uid}` returns a FLAT spec-only
+  object** — no `kind`/`metadata`/`status` wrapper, unlike `pack`/`helm`
+  describe which return the full resource. `registries` merges in
+  name/uid/isDefault/isPrivate from the `metadata` list for oci rows since
+  the describe call itself doesn't carry them.
+- **(9/15/26) `auth.password` / `auth.token` come back as the literal string
+  `"********"`** on every registry kind (pack, helm, oci) — masked
+  server-side. Unlike `cloudaccounts`, there is no per-kind endpoint this
+  verb has to avoid for secrecy.
+- **(9/15/26) A cluster's `spec.cloudConfigRef`** (`GET
+  /v1/spectroclusters/{uid}`) is `{"kind": ..., "name": ..., "uid": ...}` —
+  the cloudconfig uid is different from the cluster uid, and its `kind`
+  names the exact `/v1/cloudconfigs/{kind}/{uid}` collection to call next.
+  Confirmed for `edge-native` (rpi-inference, project SA-Craig-Smith) and
+  `eks` (hf-connect-eks-demo, same project) — this field is not
+  edge-native/maas-specific, every cloud type appears to carry one.
+  `maas` itself was not independently exercised live (no maas cluster was
+  reachable in the ~9 projects checked this session); `cloudconfig`'s code
+  path is generic on `cloudConfigRef.kind`, so it calls
+  `GET /v1/cloudconfigs/maas/{uid}` by construction, not a maas-specific
+  branch, but that exact path has not itself returned a live response yet.
+- **(9/15/26) `GET /v1/cloudconfigs/{kind}/{uid}` returns the FULL document
+  in one call** — `spec.clusterConfig` (control-plane endpoint, NTP servers,
+  overlay CIDR) and `spec.machinePoolConfig` (every pool, with its host
+  list) both come back inline. No separate machine-pools GET is needed to
+  see pool/host data; the `machinePools/{pool}` and
+  `machinePools/{uid}/machines` paths the curl-gaps scout saw were `PUT`
+  targets for partial updates, which `cloudconfig` never calls (read-only).
 
 Every list verb that can detect this (via `listmeta.count`) prints a `note:`
 line naming exactly how many rows it got vs. how many the API claims exist,
@@ -192,7 +234,7 @@ Matches `opp-axi`'s contract so both tools compose in the same agent loop:
 | 0 | `E_OK` | success |
 | 1 | `E_ERR` | API/network/op error, or anything not covered below |
 | 2 | `E_USAGE` | bad args, or a name that's ambiguous and needs disambiguating |
-| 3 | `E_NOTFOUND` | no such project/cluster/profile/edge host/pack/tenant |
+| 3 | `E_NOTFOUND` | no such project/cluster/profile/edge host/pack/tenant/registry/cloudconfig |
 | 4 | `E_REFUSED` | reserved for policy refusals — v1 has no write path to refuse, kept for symmetry with `opp-axi` and for any future verb that needs to say no |
 
 ## Env overrides
@@ -217,10 +259,6 @@ keep the same disambiguation-before-action contract as `resolve_project` /
 unique), and should very likely require a `--yes`/confirmation flag before
 any DELETE, matching the caution the `spectrocloud-clusters` skill already
 uses for teardown flows.
-
-**`registries`** — `GET /v1/registries/pack` and `/v1/registries/helm`
-(51 combined transcript refs). Left out because it's almost always a step
-inside a profile-authoring flow, which is write-adjacent and out of v1 scope.
 
 ## Develop
 

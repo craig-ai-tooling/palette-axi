@@ -513,6 +513,86 @@ def cmd_edgehosts(a):
          f"\ncount:{len(rows)} unhealthy:{unhealthy} unassigned:{unassigned}" + truncation_note())
 
 
+# Evidence probed 9/15/26 against custeng-prod, live cluster rpi-inference
+# (project SA-Craig-Smith, cloudType edge-native), why this verb resolves
+# through the cluster rather than guessing a cloudconfig path:
+#   - GET /v1/spectroclusters/{uid} carries spec.cloudConfigRef =
+#     {"kind": "edge-native", "name": "...", "uid": "<cloudconfig-uid>"} --
+#     the cloudconfig uid is DIFFERENT from the cluster uid, and its kind
+#     names the exact collection to GET next. This is the resolve-by-name-or-
+#     uid contract's missing link for cloudconfigs: there is no tenant-wide
+#     cloudconfig list to search, so the cluster is the index.
+#   - GET /v1/cloudconfigs/{kind}/{uid} (kind taken verbatim from
+#     cloudConfigRef.kind) returns the FULL document in one call --
+#     spec.clusterConfig (controlPlaneEndpoint, ntpServers, overlay CIDR,
+#     sshKeys) AND spec.machinePoolConfig (every pool, with its host list)
+#     both inline. No separate machinePools GET was needed to see pool/host
+#     data; the machinePools/{pool} and machinePools/{uid}/machines paths this
+#     task's scout doc saw were PUT targets for partial updates, out of scope
+#     here (this verb is GET-only).
+#   - maas was NOT independently confirmed live: no maas cluster was found in
+#     the ~9 custeng-prod projects checked (10 maas cloud accounts exist, but
+#     none had an attached cluster reachable this session). The code path
+#     below is generic on cloudConfigRef.kind -- it does not special-case
+#     edge-native -- so a maas cluster hits the same
+#     GET /v1/cloudconfigs/maas/{uid} call by construction, but that exact
+#     path has not itself been exercised against a live response.
+def cmd_cloudconfig(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    clusters = list_clusters(key, proj)
+
+    hit = None
+    if UID_RE.match(a.ref):
+        hit = next((c for c in clusters if dget(c, "metadata").get("uid") == a.ref), None)
+    if not hit:
+        exact = [c for c in clusters if (dget(c, "metadata").get("name") or "").lower() == a.ref.lower()]
+        cands = exact or [c for c in clusters if a.ref.lower() in (dget(c, "metadata").get("name") or "").lower()]
+        if len(cands) > 1:
+            names = ", ".join(sorted(dget(c, "metadata").get("name") for c in cands))
+            die(f"ambiguous cluster '{a.ref}': {names}", E_USAGE)
+        hit = cands[0] if cands else None
+
+    if hit:
+        cuid = dget(hit, "metadata").get("uid")
+        cname = dget(hit, "metadata").get("name")
+        cluster = api("GET", f"/v1/spectroclusters/{cuid}", key, proj)
+        ref = dget(dget(cluster, "spec"), "cloudConfigRef")
+        if not ref.get("uid"):
+            die(f"cluster '{cname}' has no spec.cloudConfigRef -- cloudType "
+                f"{dget(dget(cluster, 'spec'), 'cloudType')} may not use a cloudconfig resource", E_NOTFOUND)
+        cc_uid, cc_kind, cc_name = ref["uid"], ref.get("kind"), ref.get("name")
+    else:
+        if not a.kind or not UID_RE.match(a.ref):
+            die(f"no cluster matching '{a.ref}' in project {proj} "
+                "(pass a bare cloudconfig uid with --kind to skip cluster resolution)", E_NOTFOUND)
+        cc_uid, cc_kind, cc_name, cname = a.ref, a.kind, None, None
+
+    cc = api("GET", f"/v1/cloudconfigs/{cc_kind}/{cc_uid}", key, proj)
+    m, sp = dget(cc, "metadata"), dget(cc, "spec")
+    cfg = dget(sp, "clusterConfig")
+    cpe = dget(cfg, "controlPlaneEndpoint")
+    overlay = dget(cfg, "overlayNetworkConfiguration")
+    ntp = ", ".join(cfg.get("ntpServers") or [])
+    emit(f"tenant={a.tenant} project={proj}" + (f" cluster={cname}" if cname else ""),
+         toon("cloudconfig", ["name", "uid", "kind", "controlPlaneEndpoint", "overlayCidr", "ntpServers"],
+              [{"name": m.get("name") or cc_name, "uid": cc_uid, "kind": cc_kind,
+                "controlPlaneEndpoint": f"{cpe['host']} ({cpe.get('type')})" if cpe.get("host") else None,
+                "overlayCidr": overlay.get("cidr") if overlay.get("enable") else None,
+                "ntpServers": ntp if a.full else trunc(ntp, 60)}]))
+
+    pools = sp.get("machinePoolConfig") or []
+    prows = []
+    for p in pools:
+        hosts = p.get("hosts") or []
+        addrs = ", ".join(h.get("hostAddress", "") for h in hosts)
+        prows.append({"name": p.get("name"), "size": p.get("size"),
+                      "controlPlane": bool(p.get("isControlPlane")), "hosts": len(hosts),
+                      "hostAddresses": addrs if a.full else trunc(addrs, 60)})
+    emit(toon("machinePools", ["name", "size", "controlPlane", "hosts", "hostAddresses"], prows),
+         f"\npoolCount:{len(prows)}")
+
+
 def _pcg(item):
     """overlordUid is the PCG uid on a private-cloud account and "" on a
     public-cloud one (all 20 custeng-prod accounts carried the key, 9/14/26).
@@ -587,6 +667,97 @@ def cmd_cloudaccounts(a):
          f"clouds: {clouds_summary}" + truncation_note(),
          note,
          next_line)
+
+
+# Evidence probed 9/15/26 against custeng-prod, why this verb reads only
+# GET /v1/registries/metadata for listing and dispatches to a per-kind GET for
+# describe, mirroring cloudaccounts' "one endpoint that actually works for
+# every kind" shape rather than three separate list calls:
+#   - GET /v1/registries -> 404 (no bare collection).
+#   - GET /v1/registries/pack and /helm list fine (listmeta.continue paginated,
+#     counts 7 and 75 respectively) but GET /v1/registries/oci -> 405, Allow:
+#     DELETE — there is no working GET list endpoint for oci at all.
+#   - GET /v1/registries/metadata returns all three kinds in ONE unpaginated
+#     call (items only, no listmeta) with a flat {kind,name,uid,isDefault,
+#     isPrivate,scope} shape. It silently ignores both `kind=` and `limit=`
+#     query params (always returns the full set) — confirmed by requesting
+#     limit=5 and kind=oci and getting all 105 rows back either way.
+#   - Cross-checked trustworthy: metadata's per-kind subtotal (pack=7, helm=75,
+#     oci=23 the day this was probed) matches list_all's own listmeta.count
+#     exactly for the two kinds that have an independent paginated endpoint to
+#     check it against. There is no listmeta on metadata itself, so a future
+#     truncation can't be self-detected the way list_all's callers can.
+#   - Describe needs a per-kind call because metadata's rows carry no endpoint/
+#     auth/sync info: GET /v1/registries/{pack,helm}/{uid} returns the full
+#     kind/metadata/spec/status resource (same shape as a list item), but
+#     GET /v1/registries/oci/{uid} returns a FLAT spec-only object with no
+#     metadata/status wrapper at all — name/uid/isDefault/isPrivate for an oci
+#     registry come from the metadata pool, never from its own describe call.
+#   - auth.password / auth.token come back as the literal string "********" on
+#     every kind (pack, helm, oci) — server-side masking, confirmed live — so
+#     unlike cloudaccounts there is no per-kind endpoint this verb must avoid
+#     for secrecy; describe is safe to call.
+def _registries_metadata(key, proj):
+    data = api("GET", "/v1/registries/metadata", key, proj)
+    return data.get("items") or []
+
+
+def _registry_pool(items):
+    """Normalize metadata's flat {kind,name,uid,...} rows into the same
+    {"metadata": {"uid","name"}, ...} shape resolve_by_name expects everywhere
+    else in this tool, instead of teaching resolve_by_name a second shape."""
+    return [{"kind": i.get("kind"), "metadata": {"uid": i.get("uid"), "name": i.get("name")},
+             "isDefault": bool(i.get("isDefault")), "isPrivate": bool(i.get("isPrivate")),
+             "scope": i.get("scope")} for i in items]
+
+
+def cmd_registries(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    items = _registries_metadata(key, proj)
+    if a.kind:
+        items = [i for i in items if (i.get("kind") or "") == a.kind]
+    pool = _registry_pool(items)
+
+    if a.ref:
+        hit = resolve_by_name(a.ref, pool, "registry")
+        return _emit_registry_describe(a, key, proj, hit)
+
+    rows = [{"name": p["metadata"]["name"], "uid": p["metadata"]["uid"], "kind": p["kind"],
+             "isDefault": p["isDefault"], "isPrivate": p["isPrivate"], "scope": p["scope"]}
+            for p in pool]
+    rows.sort(key=lambda r: (r["kind"] or "", r["name"] or ""))
+    kinds = {}
+    for r in rows:
+        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+    kinds_summary = " ".join(f"{k}={kinds[k]}" for k in sorted(kinds))
+    emit(f"tenant={a.tenant}" + (f" project={proj}" if proj else ""),
+         toon("registries", ["name", "uid", "kind", "isDefault", "isPrivate", "scope"], rows),
+         f"\ncount:{len(rows)}\nkinds: {kinds_summary}",
+         nxt("palette-axi registries <name> --kind pack|helm|oci"))
+
+
+def _emit_registry_describe(a, key, proj, hit):
+    uid, name, kind = hit["metadata"]["uid"], hit["metadata"]["name"], hit["kind"]
+    if kind in ("pack", "helm"):
+        item = api("GET", f"/v1/registries/{kind}/{uid}", key, proj)
+        sp, st = dget(item, "spec"), dget(item, "status")
+        sync = dget(st, "packSyncStatus") if kind == "pack" else dget(st, "helmSyncStatus")
+        auth = dget(sp, "auth")
+        row = {"name": name, "uid": uid, "kind": kind, "endpoint": sp.get("endpoint"),
+               "authType": auth.get("type"), "tls": dget(auth, "tls").get("enabled"),
+               "isPrivate": hit["isPrivate"], "isDefault": hit["isDefault"],
+               "scope": sp.get("scope") or hit["scope"], "syncStatus": sync.get("status"), "ociType": None}
+    else:  # oci -- flat spec object, no metadata/status wrapper (confirmed live)
+        item = api("GET", f"/v1/registries/oci/{uid}", key, proj)
+        auth = dget(item, "auth")
+        row = {"name": name, "uid": uid, "kind": kind, "endpoint": item.get("endpoint"),
+               "authType": auth.get("type"), "tls": dget(auth, "tls").get("enabled"),
+               "isPrivate": hit["isPrivate"], "isDefault": hit["isDefault"],
+               "scope": item.get("scope") or hit["scope"], "syncStatus": None, "ociType": item.get("type")}
+    emit(f"tenant={a.tenant}" + (f" project={proj}" if proj else ""),
+         toon("registry", ["name", "uid", "kind", "endpoint", "authType", "tls", "isPrivate",
+                            "isDefault", "scope", "syncStatus", "ociType"], [row]))
 
 
 def cmd_events(a):
@@ -814,6 +985,23 @@ def main():
     s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
     s.add_argument("--cloud", help="filter by cloud kind (aws, azure, gcp, vsphere, maas, openstack, ...), case-insensitive")
     s.set_defaults(fn=cmd_cloudaccounts)
+
+    s = sub.add_parser("cloudconfig",
+                        help="describe a cluster's maas/edge-native cloud config and machine pools (read-only)")
+    s.add_argument("ref", help="cluster name or uid (resolves its cloudConfigRef); "
+                               "a bare cloudconfig uid also works with --kind")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--kind", choices=["maas", "edge-native"],
+                   help="only needed when ref is a bare cloudconfig uid, not a cluster ref")
+    s.add_argument("--full", action="store_true", help="untruncated ntp server / host address lists")
+    s.set_defaults(fn=cmd_cloudconfig)
+
+    s = sub.add_parser("registries",
+                        help="list pack/helm/oci registries, or describe one by name/uid")
+    s.add_argument("ref", nargs="?", help="registry name or uid to describe (omit to list)")
+    s.add_argument("--kind", choices=["pack", "helm", "oci"], help="filter the list, or scope a describe lookup")
+    s.add_argument("--project", help="project name or uid (optional; scope did not change results when probed live)")
+    s.set_defaults(fn=cmd_registries)
 
     s = sub.add_parser("events", help="recent events for a cluster (debugging)")
     s.add_argument("ref", help="cluster name or uid")
