@@ -365,6 +365,216 @@ class TestCloudAccounts(unittest.TestCase):
         self.assertNotIn("SEKRIT", out)
 
 
+class TestRegistries(unittest.TestCase):
+    """registries: GET /v1/registries/metadata for listing (the only endpoint
+    that returns pack+helm+oci together -- GET /v1/registries/oci itself
+    405s, Allow: DELETE, confirmed live 9/15/26), then a per-kind GET for
+    describe. See the why-comment above cmd_registries in cli.py for the
+    full evidence trail these fixtures pin down."""
+
+    METADATA_ITEMS = [
+        {"kind": "pack", "name": "Public Repo", "uid": "5eecc89d0b150045ae661cef",
+         "isDefault": True, "isPrivate": False, "scope": "cluster"},
+        {"kind": "helm", "name": "Bitnami", "uid": "60618888279c905820a300fe",
+         "isDefault": True, "isPrivate": False, "scope": "cluster"},
+        {"kind": "oci", "name": "ecr-registry", "uid": "64eaff453040297344bcad5d",
+         "isDefault": False, "isPrivate": True, "scope": "cluster"},
+    ]
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "params": dict(params or {})})
+            if path == "/v1/registries/metadata":
+                return {"items": [dict(i) for i in self.METADATA_ITEMS]}
+            if path == "/v1/registries/pack/5eecc89d0b150045ae661cef":
+                return {"kind": "pack",
+                        "metadata": {"name": "Public Repo", "uid": "5eecc89d0b150045ae661cef"},
+                        "spec": {"auth": {"password": "SEKRIT-pw", "token": "SEKRIT-tok", "type": "basic",
+                                          "tls": {"enabled": False}},
+                                 "endpoint": "https://registry.spectrocloud.com", "private": False,
+                                 "scope": "cluster"},
+                        "status": {"packSyncStatus": {"status": "Completed"}}}
+            if path == "/v1/registries/helm/60618888279c905820a300fe":
+                return {"kind": "helm",
+                        "metadata": {"name": "Bitnami", "uid": "60618888279c905820a300fe"},
+                        "spec": {"auth": {"type": "noAuth", "tls": {"enabled": False}},
+                                 "endpoint": "https://charts.bitnami.com/bitnami", "isPrivate": False,
+                                 "scope": "cluster"},
+                        "status": {"helmSyncStatus": {"status": "InProgress"}}}
+            if path == "/v1/registries/oci/64eaff453040297344bcad5d":
+                # Flat spec object -- NO metadata/status wrapper, confirmed live.
+                return {"auth": {"password": "SEKRIT-pw", "token": "SEKRIT-tok", "type": "token",
+                                 "tls": {"enabled": True}},
+                        "endpoint": "415789037893.dkr.ecr.us-east-1.amazonaws.com",
+                        "providerType": "pack", "scope": "cluster", "type": "ecr"}
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+
+    def _run(self, ref=None, kind=None, project=None):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": ref, "kind": kind, "project": project})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_registries(args)
+        return buf.getvalue()
+
+    def test_list_hits_metadata_only_once_no_matter_the_kind_count(self):
+        out = self._run()
+        self.assertEqual(len(self.calls), 1, "list must be a single call to the metadata endpoint")
+        self.assertEqual(self.calls[0]["path"], "/v1/registries/metadata")
+        self.assertIn("registries[3]", out)
+        self.assertIn("kinds: helm=1 oci=1 pack=1", out)
+
+    def test_kind_filter_is_client_side_not_a_query_param(self):
+        """The metadata endpoint ignores `kind=` server-side (confirmed live) --
+        the filter must happen after the fetch, and the request itself must
+        never claim a kind param the API would silently ignore anyway."""
+        out = self._run(kind="pack")
+        self.assertEqual(self.calls[0]["path"], "/v1/registries/metadata")
+        self.assertNotIn("kind", self.calls[0]["params"])
+        self.assertIn("registries[1]", out)
+        self.assertIn("Public Repo", out)
+        self.assertNotIn("Bitnami", out)
+        self.assertNotIn("ecr-registry", out)
+
+    def test_describe_pack_calls_the_pack_endpoint_not_helm_or_oci(self):
+        out = self._run(ref="Public Repo")
+        paths = [c["path"] for c in self.calls]
+        self.assertIn("/v1/registries/pack/5eecc89d0b150045ae661cef", paths)
+        self.assertNotIn("/v1/registries/helm/5eecc89d0b150045ae661cef", paths)
+        self.assertIn("registry[1]", out)
+        self.assertIn("Completed", out, "packSyncStatus.status should render as syncStatus")
+
+    def test_describe_oci_uses_the_flat_endpoint_and_pool_fields_for_the_rest(self):
+        """oci's own describe body has no isDefault/isPrivate/metadata -- those
+        must come from the metadata pool, not be silently blank."""
+        out = self._run(ref="64eaff453040297344bcad5d", kind="oci")
+        self.assertEqual(self.calls[-1]["path"], "/v1/registries/oci/64eaff453040297344bcad5d")
+        self.assertIn("ecr-registry", out)
+        self.assertIn("ecr", out, "the oci-only `type` field (ecr) should surface as ociType")
+        self.assertIn(",true,", out, "isPrivate=true from the metadata pool must reach the row")
+
+    def test_describe_never_leaks_the_masked_auth_fields(self):
+        out = self._run(ref="Public Repo")
+        self.assertNotIn("SEKRIT", out)
+
+    def test_describe_no_match_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(ref="does-not-exist")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+
+class TestCloudConfig(unittest.TestCase):
+    """cloudconfig: resolves a cluster's spec.cloudConfigRef {kind,uid} first
+    (there is no tenant-wide cloudconfig list), then GETs
+    /v1/cloudconfigs/{kind}/{uid} -- confirmed live 9/15/26 against
+    rpi-inference (SA-Craig-Smith, edge-native) that this single call returns
+    both clusterConfig and machinePoolConfig inline. See the why-comment
+    above cmd_cloudconfig in cli.py."""
+
+    CLUSTERS = [
+        {"metadata": {"name": "rpi-inference", "uid": "693064bc882df8800821d248"},
+         "spec": {"cloudType": "edge-native"}, "status": {}},
+        {"metadata": {"name": "hf-connect-eks-demo", "uid": "6aa8687d58d7515b53a51dda"},
+         "spec": {"cloudType": "eks"}, "status": {}},
+    ]
+
+    CLOUDCONFIG = {
+        "metadata": {"name": "rpi-inference-edge-native-config", "uid": "693064bb882df8800727d3d0"},
+        "spec": {
+            "clusterConfig": {
+                "controlPlaneEndpoint": {"host": "100.64.192.1", "type": "VIP"},
+                "ntpServers": ["pool.ntp.org"],
+                "overlayNetworkConfiguration": {"cidr": "100.64.192.0/23", "enable": True},
+            },
+            "machinePoolConfig": [
+                {"name": "control-plane-pool", "size": 3, "isControlPlane": True,
+                 "hosts": [{"hostAddress": "192.168.8.192"}, {"hostAddress": "192.168.8.217"},
+                           {"hostAddress": "192.168.8.198"}]},
+                {"name": "worker-pool", "size": 1, "hosts": [{"hostAddress": "192.168.8.220"}]},
+            ],
+        },
+        "status": {"conditions": None},
+    }
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve, self._listclusters = palette_axi.resolve_project, palette_axi.list_clusters
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: "proj-uid"
+        palette_axi.list_clusters = lambda key, proj: [dict(c) for c in self.CLUSTERS]
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path})
+            if path == "/v1/spectroclusters/693064bc882df8800821d248":
+                return {"metadata": {"name": "rpi-inference"},
+                        "spec": {"cloudType": "edge-native",
+                                 "cloudConfigRef": {"kind": "edge-native",
+                                                     "name": "rpi-inference-edge-native-config",
+                                                     "uid": "693064bb882df8800727d3d0"}}}
+            if path == "/v1/spectroclusters/6aa8687d58d7515b53a51dda":
+                return {"metadata": {"name": "hf-connect-eks-demo"}, "spec": {"cloudType": "eks"}}
+            if path == "/v1/cloudconfigs/edge-native/693064bb882df8800727d3d0":
+                return dict(self.CLOUDCONFIG)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project, palette_axi.list_clusters = self._resolve, self._listclusters
+
+    def _run(self, ref, kind=None, full=False):
+        args = type("A", (), {"tenant": "custeng-prod", "project": "p", "ref": ref,
+                               "kind": kind, "full": full})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_cloudconfig(args)
+        return buf.getvalue()
+
+    def test_resolves_cluster_then_calls_cloudconfigs_by_kind_and_uid(self):
+        out = self._run("rpi-inference")
+        paths = [c["path"] for c in self.calls]
+        self.assertIn("/v1/spectroclusters/693064bc882df8800821d248", paths)
+        self.assertIn("/v1/cloudconfigs/edge-native/693064bb882df8800727d3d0", paths,
+                       "must call the kind+uid from cloudConfigRef, not the cluster's own uid")
+        self.assertIn("cloudconfig[1]", out)
+        self.assertIn("100.64.192.1", out)
+
+    def test_machine_pools_come_from_the_inline_config_no_extra_call(self):
+        out = self._run("rpi-inference")
+        self.assertIn("machinePools[2]", out)
+        self.assertIn("control-plane-pool", out)
+        self.assertIn("worker-pool", out)
+        self.assertIn("poolCount:2", out)
+
+    def test_cluster_with_no_cloudconfigref_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run("hf-connect-eks-demo")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+    def test_bare_uid_with_kind_skips_cluster_resolution(self):
+        out = self._run("693064bb882df8800727d3d0", kind="edge-native")
+        paths = [c["path"] for c in self.calls]
+        self.assertNotIn("/v1/spectroclusters/693064bc882df8800821d248", paths,
+                          "a bare cloudconfig uid + --kind must not require a cluster match")
+        self.assertIn("/v1/cloudconfigs/edge-native/693064bb882df8800727d3d0", paths)
+        self.assertIn("cloudconfig[1]", out)
+
+    def test_no_match_and_no_kind_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run("nonexistent-cluster")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+
 class TestHelpForEverySubcommand(unittest.TestCase):
     """CI's own --help smoke loop lives in .github/workflows/ci.yml, a
     protected path this change does not touch, so it never learns about a
@@ -394,6 +604,8 @@ class TestHelpForEverySubcommand(unittest.TestCase):
 
         verbs = sorted(captured["action"].choices)
         self.assertIn("cloudaccounts", verbs, "the new verb must be registered")
+        self.assertIn("registries", verbs, "the new verb must be registered")
+        self.assertIn("cloudconfig", verbs, "the new verb must be registered")
 
         for verb in verbs:
             with self.subTest(verb=verb):
