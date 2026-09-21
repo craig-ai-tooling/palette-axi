@@ -1267,3 +1267,344 @@ class TestOpRateLimit(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 palette_axi._op_item_id_for_tenant("loves")
         self.assertNotIn("rate-limited", buf.getvalue())
+
+
+class TestClusterProfiles(unittest.TestCase):
+    """`cluster --profiles`: profiles + packs tables from spec.clusterProfileTemplates,
+    which is already present in the plain GET /v1/spectroclusters/{uid} response
+    cmd_cluster already fetches -- no extra API call. Evidence: a live 9/21/26
+    session needed exactly this (which profiles/pack tags a
+    cluster runs, to build a Portworx layer) and had to drop to a raw urllib
+    GET for it, because `cluster --full` shows state/conditions but never
+    profile attachment. Fixtures below are entirely synthetic, not customer
+    data, per AGENTS.md."""
+
+    PROJECT_UID = "6720c668e9746cb63a499099"
+    CLUSTER_UID = "693064bc882df8800821f001"
+
+    TEMPLATES = [
+        {"name": "infra-edge-profile", "uid": "693064bc882df8800821f101",
+         "type": "infra", "profileVersion": "1.2.0",
+         "packs": [{"name": "edge-native-byoi", "layer": "os", "tag": "2.1.0"},
+                   {"name": "edge-k8s", "layer": "k8s", "tag": "1.33.5"}]},
+        {"name": "addon-storage-profile", "uid": "693064bc882df8800821f102",
+         "type": "add-on", "version": "3.0.0",
+         "packs": [{"name": "csi-portworx-generic", "layer": "storage", "tag": "3.7.0"}]},
+    ]
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve = palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        cluster = {
+            "metadata": {"name": "test-cluster", "uid": self.CLUSTER_UID,
+                         "creationTimestamp": "2026-06-01T12:00:00Z"},
+            "spec": {"cloudType": "edge-native", "cloudConfig": {"machinePools": []},
+                     "clusterProfileTemplates": self.TEMPLATES},
+        }
+        overview = {"status": {"state": "Running", "health": {"state": "Healthy"}, "conditions": []}}
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append((method, path))
+            if path == "/v1/dashboard/spectroclusters/search":
+                return {"items": [{"metadata": {"name": "test-cluster", "uid": self.CLUSTER_UID}}],
+                        "listmeta": {"count": 1}}
+            if path == f"/v1/spectroclusters/{self.CLUSTER_UID}":
+                return dict(cluster)
+            if path == f"/v1/dashboard/spectroclusters/{self.CLUSTER_UID}/overview":
+                return dict(overview)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project = self._resolve
+
+    def _run(self, profiles=False, full=False):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": "test-cluster", "project": "p",
+                               "full": full, "profiles": profiles})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_cluster(args)
+        return buf.getvalue()
+
+    def test_default_output_omits_profile_and_pack_tables(self):
+        out = self._run(profiles=False)
+        self.assertNotIn("profiles[", out)
+        self.assertNotIn("packs[", out)
+        self.assertNotIn("infra-edge-profile", out)
+        self.assertNotIn("edge-native-byoi", out)
+        self.assertIn("cluster[1]", out)
+        self.assertIn("conditions[0]", out)
+
+    def test_profiles_flag_adds_profiles_and_packs_tables(self):
+        out = self._run(profiles=True)
+        self.assertIn("profiles[2]{name,version,type,uid}:", out)
+        self.assertIn("infra-edge-profile,1.2.0,infra,693064bc882df8800821f101", out)
+        self.assertIn("addon-storage-profile,3.0.0,add-on,693064bc882df8800821f102", out,
+                      "version must fall back to spec.version when profileVersion is absent")
+        self.assertIn("packs[3]{profile,layer,name,tag}:", out)
+        self.assertIn("infra-edge-profile,os,edge-native-byoi,2.1.0", out)
+        self.assertIn("infra-edge-profile,k8s,edge-k8s,1.33.5", out)
+        self.assertIn("addon-storage-profile,storage,csi-portworx-generic,3.7.0", out)
+
+    def test_profiles_flag_makes_no_extra_api_call(self):
+        self._run(profiles=False)
+        calls_without = list(self.calls)
+        self.calls = []
+        self._run(profiles=True)
+        calls_with = list(self.calls)
+        self.assertEqual(calls_without, calls_with,
+                         "the --profiles tables must come from the cluster GET already made")
+
+
+class TestProfileVariables(unittest.TestCase):
+    """`profile --variables`: GET /v1/clusterprofiles/{uid}/variables ->
+    {"variables":[{name, displayName, defaultValue, format, required,
+    immutable, hidden, isSensitive}]}. Evidence: the same 9/21/26 live
+    session needed a profile's declared variables and had to drop to a raw
+    urllib GET for it. Fixtures are synthetic, not customer data."""
+
+    PROJECT_UID = "6720c668e9746cb63a499201"
+    PROFILE_UID = "693064bc882df8800821f201"
+    SECRET_VALUE = "real-secret-value-should-never-print"
+
+    VARIABLES = [
+        {"name": "K8sPodCIDR", "displayName": "Pod CIDR", "defaultValue": "100.64.0.0/18",
+         "format": "cidr", "required": True, "immutable": False, "hidden": False, "isSensitive": False},
+        {"name": "K8sServiceCIDR", "displayName": "Service CIDR", "defaultValue": "100.64.64.0/18",
+         "format": "cidr", "required": True, "immutable": False, "hidden": False, "isSensitive": False},
+        {"name": "PureSanType", "displayName": "Pure SAN Type", "defaultValue": "FC",
+         "format": "string", "required": False, "immutable": True, "hidden": False, "isSensitive": False},
+        {"name": "PxApiToken", "displayName": "Portworx API Token", "defaultValue": SECRET_VALUE,
+         "format": "string", "required": True, "immutable": False, "hidden": True, "isSensitive": True},
+    ]
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve = palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        profile = {
+            "metadata": {"name": "vmo-infra-profile", "uid": self.PROFILE_UID},
+            "spec": {"version": "1.0.0", "cloudType": "edge-native",
+                     "published": {"type": "infra",
+                                   "packs": [{"name": "edge-k8s", "layer": "k8s", "tag": "1.33.5",
+                                              "registryUid": "693064bc882df8800821f2ff"}]}},
+        }
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project})
+            if path == "/v1/clusterprofiles":
+                return {"items": [{"metadata": {"name": "vmo-infra-profile", "uid": self.PROFILE_UID}}],
+                        "listmeta": {"count": 1}}
+            if path == f"/v1/clusterprofiles/{self.PROFILE_UID}":
+                return dict(profile)
+            if path == f"/v1/clusterprofiles/{self.PROFILE_UID}/variables":
+                return {"variables": [dict(v) for v in self.VARIABLES]}
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project = self._resolve
+
+    def _run(self, variables=False, full=False):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": "vmo-infra-profile", "project": "p",
+                               "full": full, "variables": variables})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_profile(args)
+        return buf.getvalue()
+
+    def test_default_output_omits_variables_table_and_never_calls_the_endpoint(self):
+        out = self._run(variables=False)
+        self.assertNotIn("variables[", out)
+        self.assertNotIn("K8sPodCIDR", out)
+        paths = [c["path"] for c in self.calls]
+        self.assertNotIn(f"/v1/clusterprofiles/{self.PROFILE_UID}/variables", paths)
+
+    def test_variables_flag_calls_the_endpoint_with_projectuid(self):
+        self._run(variables=True)
+        hit = next(c for c in self.calls
+                   if c["path"] == f"/v1/clusterprofiles/{self.PROFILE_UID}/variables")
+        self.assertEqual(hit["project"], self.PROJECT_UID)
+
+    def test_variables_table_renders_non_sensitive_fields(self):
+        out = self._run(variables=True)
+        self.assertIn("variables[4]{name,default,format,required,immutable,hidden,sensitive}:", out)
+        self.assertIn("K8sPodCIDR,100.64.0.0/18,cidr,true,false,false,false", out)
+        self.assertIn("K8sServiceCIDR,100.64.64.0/18,cidr,true,false,false,false", out)
+        self.assertIn("PureSanType,FC,string,false,true,false,false", out)
+
+    def test_sensitive_default_renders_masked_and_never_leaks_the_value(self):
+        out = self._run(variables=True)
+        self.assertIn("PxApiToken,********,string,true,false,true,true", out)
+        self.assertNotIn(self.SECRET_VALUE, out)
+
+
+class TestPackValues(unittest.TestCase):
+    """`pack-values <name> <version>`: resolves the pack uid via the same
+    /v1/packs search cmd_packs already uses, then
+    GET /v1/packs/{uid}?includePackValues=true (ProjectUid header) for
+    packValues[0].{values, presets[]}. Evidence: a 9/21/26 live
+    session found csi-portworx-generic 3.7.0 in two registries in one
+    project and had to drop to a raw urllib GET to get default values and
+    a named preset's add/remove pair for a Portworx layer. Fixtures below are
+    entirely synthetic, not customer data."""
+
+    PROJECT_UID = "6720c668e9746cb63a499301"
+    NAME = "csi-portworx-generic"
+    VERSION = "3.7.0"
+    REGISTRY_A = "5eecc89d0b150045ae661ce1"
+    REGISTRY_B = "64eaff453040297344bcad51"
+    UID_A = "693064bc882df8800821f301"
+    UID_B = "693064bc882df8800821f302"
+
+    VALUES_YAML = "# spectrocloud.com/enabled-presets: []\nfoo: bar\nbaz:\n  qux: 1\n  quux: 2\n"
+
+    PRESETS = [
+        {"name": "px-csi", "group": "csi", "label": "Portworx CSI",
+         "add": "csi:\n  enabled: true\n", "remove": []},
+        {"name": "px-spec-flasharray-csi", "group": "csi", "label": "Flasharray CSI",
+         "add": "flasharray:\n  enabled: true\n", "remove": ["spec.foo", "spec.bar"]},
+    ]
+
+    def _packs_list(self):
+        return [
+            {"metadata": {"uid": self.UID_A, "name": self.NAME},
+             "spec": {"version": self.VERSION, "registryUid": self.REGISTRY_A, "layer": "storage"},
+             "status": {"disabled": False}},
+            {"metadata": {"uid": self.UID_B, "name": self.NAME},
+             "spec": {"version": self.VERSION, "registryUid": self.REGISTRY_B, "layer": "storage"},
+             "status": {"disabled": False}},
+            {"metadata": {"uid": "693064bc882df8800821f303", "name": self.NAME},
+             "spec": {"version": "3.6.0", "registryUid": self.REGISTRY_A, "layer": "storage"},
+             "status": {"disabled": False}},
+        ]
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve = palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project,
+                                "params": dict(params or {})})
+            if path == "/v1/packs":
+                return {"items": self._packs_list(), "listmeta": {"count": 3}}
+            if path == f"/v1/packs/{self.UID_B}":
+                return {"packValues": [{"values": self.VALUES_YAML, "presets": self.PRESETS,
+                                        "readme": "...", "schema": "..."}]}
+            if path == f"/v1/packs/{self.UID_A}":
+                return {"packValues": [{"values": self.VALUES_YAML, "presets": [],
+                                        "readme": "", "schema": ""}]}
+            if path == "/v1/packs/693064bc882df8800821f303":  # the sole 3.6.0 pack, registry A
+                return {"packValues": [{"values": self.VALUES_YAML, "presets": [],
+                                        "readme": "", "schema": ""}]}
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project = self._resolve
+
+    def _run(self, name=None, version=None, registry=None, values=False, preset=None):
+        args = type("A", (), {"tenant": "custeng-prod", "name": name or self.NAME,
+                               "version": version or self.VERSION, "project": "p",
+                               "registry": registry, "values": values, "preset": preset})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_pack_values(args)
+        return buf.getvalue()
+
+    def test_list_call_filters_by_name(self):
+        self._run(registry=self.REGISTRY_B[:8])
+        list_calls = [c for c in self.calls if c["path"] == "/v1/packs"]
+        self.assertTrue(list_calls, "expected a call to /v1/packs")
+        self.assertEqual(list_calls[0]["params"].get("filters"), f"metadata.name={self.NAME}")
+
+    def test_ambiguous_without_registry_exits_usage_listing_registry_uids(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                self._run()
+        self.assertEqual(ctx.exception.code, palette_axi.E_USAGE)
+        err = buf.getvalue()
+        self.assertIn(self.REGISTRY_A, err)
+        self.assertIn(self.REGISTRY_B, err)
+
+    def test_registry_prefix_disambiguates_and_issues_the_exact_request(self):
+        out = self._run(registry=self.REGISTRY_B[:8])
+        describe_calls = [c for c in self.calls if c["path"] == f"/v1/packs/{self.UID_B}"]
+        self.assertEqual(len(describe_calls), 1)
+        call = describe_calls[0]
+        self.assertEqual(call["project"], self.PROJECT_UID,
+                         "ProjectUid header must carry the resolved project")
+        self.assertEqual(call["params"].get("includePackValues"), "true")
+        self.assertIn("pack[1]{name,version,uid,registryUid,lines,presetCount}:", out)
+        self.assertIn(self.REGISTRY_B, out)
+        self.assertIn("presets[2]{name,group,removes}:", out)
+        self.assertIn(f"{self.VERSION},{self.UID_B},{self.REGISTRY_B},5,2", out, "lines=5, presetCount=2")
+
+    def test_values_flag_prints_only_the_yaml(self):
+        out = self._run(registry=self.REGISTRY_B[:8], values=True)
+        self.assertEqual(out, self.VALUES_YAML.rstrip("\n") + "\n")
+
+    def test_preset_flag_prints_add_yaml_and_remove_block(self):
+        out = self._run(registry=self.REGISTRY_B[:8], preset="px-spec-flasharray-csi")
+        self.assertIn("flasharray:\n  enabled: true", out)
+        self.assertIn("# remove:", out)
+        self.assertIn("#   spec.foo", out)
+        self.assertIn("#   spec.bar", out)
+
+    def test_unknown_preset_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(registry=self.REGISTRY_B[:8], preset="does-not-exist")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+    def test_unambiguous_version_needs_no_registry_flag(self):
+        out = self._run(version="3.6.0")
+        self.assertIn(self.REGISTRY_A, out)
+
+    def test_no_matching_version_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(version="9.9.9")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+
+class TestPackValuesHelpRegistered(unittest.TestCase):
+    """pack-values must show up in the dynamic --help loop TestHelpForEverySubcommand
+    already runs over every registered verb -- this just pins that it's registered
+    at all, since a verb silently missing from argparse would still pass that loop."""
+
+    def test_pack_values_is_a_registered_subcommand(self):
+        real_add_subparsers = argparse.ArgumentParser.add_subparsers
+        captured = {}
+
+        def spy(self, *a, **k):
+            action = real_add_subparsers(self, *a, **k)
+            captured["action"] = action
+            return action
+
+        argparse.ArgumentParser.add_subparsers = spy
+        old_argv = sys.argv
+        try:
+            sys.argv = ["palette-axi", "--help"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    palette_axi.main()
+        finally:
+            argparse.ArgumentParser.add_subparsers = real_add_subparsers
+            sys.argv = old_argv
+        self.assertIn("pack-values", captured["action"].choices)
