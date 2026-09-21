@@ -137,6 +137,12 @@ palette-axi cluster rpi-inference --project SA-Craig-Smith --full   # all condit
 palette-axi profiles --project SA-Craig-Smith
 palette-axi profile craig-nvidia --project SA-Craig-Smith
 palette-axi edgehosts --project SA-Craig-Smith
+palette-axi edgehosts --project SA-Craig-Smith --wide       # + cores, memGB, disks, sanDisks, ip, secureBoot
+palette-axi edgehosts --project SA-Craig-Smith --min-cores 64
+palette-axi edgehosts --project SA-Craig-Smith --label site=dal-dc1
+palette-axi edgehost ucs-blade-01 --project SA-Craig-Smith  # one host's hardware inventory
+palette-axi edgehost 693064bc882df8800821e001               # no --project: searches every project
+palette-axi edgehost ucs-blade-01 --all-nics                # include lxc*/cilium*/veth*/... noise
 palette-axi cloudaccounts --project SA-Craig-Smith --cloud aws  # cloud accounts visible to that project
 palette-axi cloudconfig rpi-inference --project SA-Craig-Smith # cluster's cloud config + machine pools
 palette-axi events rpi-inference --project SA-Craig-Smith --limit 100
@@ -156,7 +162,8 @@ palette-axi registries "Public Repo"                       # describe one by nam
 | `cluster` | `GET /v1/spectroclusters/{uid}` + `GET /v1/dashboard/spectroclusters/{uid}/overview` | Same health gap as above at the single-resource level; conditions come from the overview surface per the `spectrocloud-troubleshooting` skill's own debugging workflow. |
 | `profiles` | `GET /v1/clusterprofiles` | 111+ direct refs; profile discovery precedes almost every profile-editing session. |
 | `profile` | `GET /v1/clusterprofiles/{uid}` | Layer/pack shape (`spec.published.packs[].tag`) confirmed against a real transcript that was diffing two profile versions. |
-| `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. |
+| `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. `--wide` adds hardware columns (cores, memGB, disks, sanDisks, ip, secureBoot) from `spec.device`; `--min-cores`/`--label` filter client-side. Default output (no `--wide`) is unchanged. |
+| `edgehost` | `GET /v1/edgehosts/{uid}` | An SE with a UID from a ticket or a name from a customer often doesn't have the project. Resolves the ref (uid/name/substring) against the same edge host search `edgehosts` uses, scoped to `--project` if given, else walks every project and reports which one matched. Prints the full hardware inventory: cpu/memory, OS, disks + partitions, NICs (virtual/container interfaces like `lxc*`/`cilium*`/`veth*`/`flannel*`/`cni*`/`docker*`/`kube-ipvs*`/`vxlan*`/`genev*`/`tunl*`/`lo` hidden by default, `--all-nics` to show them), gpu count. See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `cloudaccounts` | `GET /v1/cloudaccounts/summary` | Lists every cloud type (aws, azure, gcp, vsphere, maas, openstack, ...) in one call. Never hits a per-cloud endpoint — see [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below for why. |
 | `cloudconfig` | `GET /v1/spectroclusters/{uid}` + `GET /v1/cloudconfigs/{kind}/{uid}` | 23 combined transcript refs, 13.0% failing, zero prior coverage. A cluster's `spec.cloudConfigRef` names the exact `{kind, uid}` to GET next — there is no tenant-wide cloudconfig list, so the cluster is the index. Read-only: the write calls this scout doc also saw (`PUT clusterConfig`, `PUT machinePools/...`) are deliberately out of scope. |
 | `events` | `GET /v1/events/components/spectrocluster/{uid}` | **Not** `/v1/spectroclusters/{uid}/events` or `.../status/events` — both of those 404 or 422 in practice. A real session in the transcripts probed six candidate endpoints live and found this one; that probe's exact result is what this verb uses. |
@@ -249,6 +256,30 @@ skills:
   see pool/host data; the `machinePools/{pool}` and
   `machinePools/{uid}/machines` paths the curl-gaps scout saw were `PUT`
   targets for partial updates, which `cloudconfig` never calls (read-only).
+
+- **`GET /v1/edgehosts/{uid}` carries the device inventory at `spec.device`** —
+  `archType`, `cpu.cores`, `memory.sizeInMB`, `secureBoot`, `hostType`,
+  `hostState`, `os{family,version,kernelVersion}`, `disks[]{controller,size,
+  vendor,partitions[]}`, `nics[]{nicName,macAddr,ip,subnet,gateway,dns[],
+  isDefault}`, `gpus[]`. `spec.host{hostAddress,macAddress,hostUid}` is a
+  sibling of `spec.device`, not nested under it. This is the shape the
+  `edgehosts` list has never surfaced (name/uid/state/health/cluster only);
+  `edgehost` and `edgehosts --wide` are the verbs that read it. A real NIC
+  list carries container/CNI plumbing alongside the physical/bond/vlan
+  interfaces (one live host: 28 NICs, ~4 physical) — `edgehost` hides
+  `lxc*`/`cilium*`/`veth*`/`flannel*`/`cni*`/`docker*`/`kube-ipvs*`/`vxlan*`/
+  `genev*`/`tunl*`/`lo` by default. `edgehosts --wide`'s `sanDisks` is a
+  disk-vendor heuristic (`PURE`/`NETAPP`/`EMC`/`HITACHI`/`IBM`), not a real
+  SAN/LUN protocol check. **Not independently probed live this session** —
+  the 1Password service account's read limit was exhausted (see the Key
+  cache section above); the shape above comes from a previously saved real
+  response, and this build's own request/response handling for `edgehost`
+  and `edgehosts --wide` is offline-tested only. Whether the edgehosts
+  *search* response (`EDGEHOSTS_PATH`, what `edgehosts` and `edgehost`'s
+  resolution step both call) already carries `spec.device` inline, or only
+  the metadata/status shape `edgehosts` has always rendered, is also
+  unverified live — `--wide`'s per-host fallback GET exists for the case
+  where it doesn't; see `_wide_fields()`'s docstring in `cli.py`.
 
 Every list verb that can detect this (via `listmeta.count`) prints a `note:`
 line naming exactly how many rows it got vs. how many the API claims exist,

@@ -234,7 +234,7 @@ class TestEdgehostsEndpoint(unittest.TestCase):
         palette_axi.get_api_key, palette_axi.resolve_project = self._key, self._resolve
 
     def test_edgehosts_does_not_call_the_retired_endpoint(self):
-        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p"})())
+        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p", "wide": False, "min_cores": None, "label": None})())
         paths = [p for _, p, _ in self.calls]
         self.assertTrue(paths, "cmd_edgehosts issued no request")
         self.assertNotIn("/v1/edgehosts", paths, "still calling the 405 endpoint")
@@ -243,11 +243,380 @@ class TestEdgehostsEndpoint(unittest.TestCase):
     def test_it_posts_a_search_body(self):
         """The search endpoint is POST-only; a GET returns 405 and a POST with no
         body is not what the API accepts."""
-        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p"})())
+        palette_axi.cmd_edgehosts(type("A", (), {"tenant": "t", "project": "p", "wide": False, "min_cores": None, "label": None})())
         method, _, body = self.calls[0]
         self.assertEqual(method, "POST")
         self.assertIsNotNone(body, "no JSON body sent to a POST-only search endpoint")
         self.assertIn("filter", body)
+
+
+class TestEdgehostVerb(unittest.TestCase):
+    """`edgehost <ref>`: single-host hardware inventory. Fixtures below are
+    entirely synthetic (no customer values) but match the field names/types
+    read from a real GET /v1/edgehosts/{uid} response, per AGENTS.md."""
+
+    PROJECT_UID = "6720c668e9746cb63a499001"
+    EDGEHOST_UID = "693064bc882df8800821e001"
+
+    SEARCH_ITEM = {
+        "metadata": {"name": "ucs-blade-01", "uid": EDGEHOST_UID, "labels": {"site": "dal"}},
+        "status": {"state": "ready", "health": {"state": "healthy", "agentVersion": "4.2.0"},
+                   "inUseClusters": [{"name": "edge-cluster-1", "uid": "cluster-uid-1"}]},
+    }
+
+    DESCRIBE = {
+        "metadata": {"name": "ucs-blade-01", "uid": EDGEHOST_UID, "labels": {"site": "dal"},
+                     "annotations": {"spectrocloud.com/deviceType": "bare-metal"},
+                     "creationTimestamp": "2026-06-01T12:00:00Z"},
+        "spec": {
+            "device": {
+                "archType": "amd64", "hostType": "agent-mode", "hostState": "paired",
+                "secureBoot": True, "cpu": {"cores": 96}, "memory": {"sizeInMB": 786432},
+                "os": {"family": "ubuntu", "version": "22.04", "kernelVersion": "5.15.0-91-generic"},
+                "disks": [
+                    {"controller": "MegaRAID", "size": 1800, "vendor": "DELL",
+                     "partitions": [{"fileSystemType": "ext4", "freeSpace": 100,
+                                     "mountPoint": "/", "totalSpace": 1800}]},
+                    {"controller": "FC", "size": 5000, "vendor": "PURE",
+                     "partitions": [{"fileSystemType": "xfs", "freeSpace": 500,
+                                     "mountPoint": "/data", "totalSpace": 5000}]},
+                ],
+                "nics": [
+                    {"nicName": "eth0", "macAddr": "aa:bb:cc:00:11:22", "ip": "10.0.0.5",
+                     "subnet": "255.255.255.0", "gateway": "10.0.0.1", "dns": ["8.8.8.8"],
+                     "isDefault": True},
+                    {"nicName": "bond0", "macAddr": "aa:bb:cc:00:11:23", "ip": "10.0.1.5",
+                     "subnet": "255.255.255.0", "gateway": "10.0.1.1", "dns": [], "isDefault": False},
+                    {"nicName": "cilium_host", "macAddr": "aa:bb:cc:00:11:99", "ip": "172.16.0.1",
+                     "subnet": "", "gateway": "", "dns": [], "isDefault": False},
+                    {"nicName": "vethabcdef", "macAddr": "aa:bb:cc:00:11:98", "ip": "",
+                     "subnet": "", "gateway": "", "dns": [], "isDefault": False},
+                ],
+                "gpus": [],
+            },
+            "host": {"hostAddress": "10.0.0.5", "macAddress": "aa:bb:cc:00:11:22", "hostUid": "host-uid-1"},
+        },
+        "status": {"state": "ready", "health": {"state": "healthy", "agentVersion": "4.2.0", "message": ""},
+                   "inUseClusters": [{"name": "edge-cluster-1", "uid": "cluster-uid-1"}]},
+    }
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve = palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project, "body": json_body})
+            if path == palette_axi.EDGEHOSTS_PATH:
+                return {"items": [dict(self.SEARCH_ITEM)], "listmeta": {"count": 1}}
+            if path == f"/v1/edgehosts/{self.EDGEHOST_UID}":
+                return dict(self.DESCRIBE)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project = self._resolve
+
+    def _run(self, ref, project="SA-Craig-Smith", all_projects=False, all_nics=False, json_out=False):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": ref, "project": project,
+                               "all_projects": all_projects, "all_nics": all_nics, "json": json_out})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_edgehost(args)
+        return buf.getvalue()
+
+    def test_resolves_in_project_then_describes_with_projectuid(self):
+        out = self._run("ucs-blade-01")
+        calls = [(c["method"], c["path"], c["project"]) for c in self.calls]
+        self.assertIn(("POST", palette_axi.EDGEHOSTS_PATH, self.PROJECT_UID), calls)
+        self.assertIn(("GET", f"/v1/edgehosts/{self.EDGEHOST_UID}", self.PROJECT_UID), calls,
+                       "describe call must carry the resolved project as ProjectUid")
+        self.assertIn("edgehost[1]", out)
+
+    def test_summary_fields_render(self):
+        out = self._run("ucs-blade-01")
+        self.assertIn("ucs-blade-01", out)
+        self.assertIn("agent-mode", out)
+        self.assertIn("amd64", out)
+        self.assertIn("ubuntu 22.04", out)
+        self.assertIn("5.15.0-91-generic", out)
+        self.assertIn("edge-cluster-1", out)
+        self.assertIn("site=dal", out)
+        self.assertIn("96", out)  # cores
+        self.assertIn("768.0", out)  # 786432 MB / 1024, rounded 1dp
+
+    def test_disks_table_shows_vendor_and_partition_count(self):
+        out = self._run("ucs-blade-01")
+        self.assertIn("disks[2]", out)
+        self.assertIn("PURE", out)
+        self.assertIn("/data", out)
+
+    def test_virtual_nics_hidden_by_default(self):
+        out = self._run("ucs-blade-01")
+        self.assertIn("nics[2]", out, "expected only the 2 physical nics by default")
+        self.assertIn("eth0", out)
+        self.assertIn("bond0", out)
+        self.assertNotIn("cilium_host", out)
+        self.assertNotIn("vethabcdef", out)
+        self.assertIn("+2 virtual hidden", out)
+
+    def test_all_nics_shows_virtual_interfaces(self):
+        out = self._run("ucs-blade-01", all_nics=True)
+        self.assertIn("nics[4]", out)
+        self.assertIn("cilium_host", out)
+        self.assertIn("vethabcdef", out)
+
+    def test_gpu_count_zero_renders(self):
+        out = self._run("ucs-blade-01")
+        self.assertIn("gpuCount:0", out)
+
+    def test_json_dumps_raw_object(self):
+        out = self._run("ucs-blade-01", json_out=True)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["metadata"]["uid"], self.EDGEHOST_UID)
+
+    def test_ambiguous_ref_in_project_exits_usage(self):
+        second = {"metadata": {"name": "ucs-blade-02", "uid": "693064bc882df8800821e002",
+                                "labels": {}},
+                   "status": {"state": "ready", "health": {"state": "healthy"}, "inUseClusters": []}}
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project})
+            if path == palette_axi.EDGEHOSTS_PATH:
+                return {"items": [dict(self.SEARCH_ITEM), second], "listmeta": {"count": 2}}
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+        with self.assertRaises(SystemExit) as ctx:
+            self._run("ucs-blade")
+        self.assertEqual(ctx.exception.code, palette_axi.E_USAGE)
+
+    def test_not_found_in_project_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run("does-not-exist")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+
+class TestEdgehostNullFields(unittest.TestCase):
+    """Confirmed live elsewhere in this tool: objects on these endpoints carry
+    explicit JSON nulls rather than omitted keys (see dget()'s own docstring).
+    Every nested access cmd_edgehost makes must survive the same treatment."""
+
+    PROJECT_UID = "6720c668e9746cb63a499003"
+    EDGEHOST_UID = "693064bc882df8800821e003"
+
+    SEARCH_ITEM = {"metadata": {"name": "bare-host", "uid": EDGEHOST_UID, "labels": None},
+                   "status": {"state": "ready", "health": None, "inUseClusters": None}}
+
+    DESCRIBE = {
+        "metadata": {"name": "bare-host", "uid": EDGEHOST_UID, "labels": None,
+                     "annotations": None, "creationTimestamp": None},
+        "spec": {
+            "device": {"archType": "amd64", "hostType": "agent-mode", "hostState": None,
+                       "secureBoot": None, "cpu": None, "memory": None, "os": None,
+                       "disks": None, "nics": None, "gpus": None},
+            "host": None,
+        },
+        "status": {"state": "ready", "health": None, "inUseClusters": None},
+    }
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        self._resolve = palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append((method, path, project))
+            if path == palette_axi.EDGEHOSTS_PATH:
+                return {"items": [dict(self.SEARCH_ITEM)], "listmeta": {"count": 1}}
+            if path == f"/v1/edgehosts/{self.EDGEHOST_UID}":
+                return dict(self.DESCRIBE)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+        palette_axi.resolve_project = self._resolve
+
+    def test_null_device_subfields_do_not_crash(self):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": "bare-host", "project": "p",
+                               "all_projects": False, "all_nics": False, "json": False})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_edgehost(args)
+        out = buf.getvalue()
+        self.assertIn("edgehost[1]", out)
+        self.assertIn("disks[0]{idx,vendor,controller,sizeGB,partitions,mounts}: (none)", out)
+        self.assertIn("nics[0]{name,mac,ip,subnet,gateway,default}: (none)", out)
+        self.assertIn("gpuCount:0", out)
+
+
+class TestEdgehostAllProjects(unittest.TestCase):
+    """No --project and no $PALETTE_PROJECT: search every project and report
+    which one actually had the host -- the common case an SE hits with a UID
+    from a support ticket but no project name."""
+
+    PROJECT_A = {"metadata": {"name": "Project-A", "uid": "6720c668e9746cb63a499010"}}
+    PROJECT_B = {"metadata": {"name": "Project-B", "uid": "6720c668e9746cb63a499011"}}
+    EDGEHOST_UID = "693064bc882df8800821e010"
+
+    SEARCH_ITEM = {"metadata": {"name": "ucs-blade-b", "uid": EDGEHOST_UID, "labels": {}},
+                   "status": {"state": "ready", "health": {"state": "healthy"}, "inUseClusters": []}}
+
+    DESCRIBE = {
+        "metadata": {"name": "ucs-blade-b", "uid": EDGEHOST_UID, "labels": {}},
+        "spec": {"device": {"archType": "amd64", "hostType": "agent-mode", "cpu": {"cores": 32},
+                            "memory": {"sizeInMB": 65536}, "os": {}, "disks": [], "nics": [], "gpus": []},
+                 "host": {"hostAddress": "10.0.2.9"}},
+        "status": {"state": "ready", "health": {"state": "healthy"}, "inUseClusters": []},
+    }
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._key = palette_axi.api, palette_axi.get_api_key
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append({"method": method, "path": path, "project": project})
+            if path == palette_axi.PROJECTS_PATH:
+                return {"items": [dict(self.PROJECT_A), dict(self.PROJECT_B)], "listmeta": {"count": 2}}
+            if path == palette_axi.EDGEHOSTS_PATH and project == self.PROJECT_A["metadata"]["uid"]:
+                return {"items": [], "listmeta": {"count": 0}}
+            if path == palette_axi.EDGEHOSTS_PATH and project == self.PROJECT_B["metadata"]["uid"]:
+                return {"items": [dict(self.SEARCH_ITEM)], "listmeta": {"count": 1}}
+            if path == f"/v1/edgehosts/{self.EDGEHOST_UID}":
+                return dict(self.DESCRIBE)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.get_api_key = self._api, self._key
+
+    def _run(self, ref, project=None, all_projects=False):
+        args = type("A", (), {"tenant": "custeng-prod", "ref": ref, "project": project,
+                               "all_projects": all_projects, "all_nics": False, "json": False})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_edgehost(args)
+        return buf.getvalue()
+
+    def test_no_project_flag_searches_every_project_and_finds_the_right_one(self):
+        out = self._run("ucs-blade-b")
+        calls = [(c["path"], c["project"]) for c in self.calls]
+        self.assertIn((palette_axi.EDGEHOSTS_PATH, self.PROJECT_A["metadata"]["uid"]), calls,
+                       "must have searched Project-A even though the host isn't there")
+        self.assertIn((palette_axi.EDGEHOSTS_PATH, self.PROJECT_B["metadata"]["uid"]), calls)
+        self.assertIn((f"/v1/edgehosts/{self.EDGEHOST_UID}", self.PROJECT_B["metadata"]["uid"]), calls,
+                       "describe call must use the project that actually matched, not the first one tried")
+        self.assertIn("Project-B", out, "must report which project the host was found in")
+        self.assertIn("edgehost[1]", out)
+
+    def test_all_projects_flag_forces_search_even_with_project_set(self):
+        self._run("ucs-blade-b", project="Project-A", all_projects=True)
+        calls = [(c["path"], c["project"]) for c in self.calls]
+        self.assertIn((palette_axi.EDGEHOSTS_PATH, self.PROJECT_A["metadata"]["uid"]), calls)
+        self.assertIn((palette_axi.EDGEHOSTS_PATH, self.PROJECT_B["metadata"]["uid"]), calls)
+
+    def test_no_match_in_any_project_exits_notfound(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run("nonexistent-host")
+        self.assertEqual(ctx.exception.code, palette_axi.E_NOTFOUND)
+
+
+class TestEdgehostsWide(unittest.TestCase):
+    """edgehosts --wide / --min-cores / --label. The no-wide, no-filter path
+    must stay byte-identical to what TestEdgehostsEndpoint already pins down --
+    this class adds the new coverage without touching that existing test."""
+
+    PROJECT_UID = "proj-uid"
+    ITEM_NO_DEVICE = {"metadata": {"name": "edge-01", "uid": "host-1", "labels": {"env": "prod"}},
+                       "status": {"state": "ready", "health": {"state": "healthy"},
+                                  "inUseClusters": [{"name": "c1"}]}}
+    DESCRIBE = {
+        "metadata": {"name": "edge-01", "uid": "host-1"},
+        "spec": {"device": {"cpu": {"cores": 96}, "memory": {"sizeInMB": 786432},
+                            "secureBoot": True,
+                            "disks": [{"vendor": "PURE"}, {"vendor": "DELL"}]},
+                 "host": {"hostAddress": "10.0.0.9"}},
+        "status": {"state": "ready", "health": {"state": "healthy"}, "inUseClusters": [{"name": "c1"}]},
+    }
+
+    def setUp(self):
+        self.calls = []
+        self._api, self._emit = palette_axi.api, palette_axi.emit
+        self._key, self._resolve = palette_axi.get_api_key, palette_axi.resolve_project
+        palette_axi.get_api_key = lambda tenant: "stub-key"
+        palette_axi.resolve_project = lambda ref, key: self.PROJECT_UID
+
+        def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+            self.calls.append((method, path, project, json_body))
+            if path == palette_axi.EDGEHOSTS_PATH:
+                return {"items": [dict(self.ITEM_NO_DEVICE)], "listmeta": {"count": 1}}
+            if path == "/v1/edgehosts/host-1":
+                return dict(self.DESCRIBE)
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        palette_axi.api = fake_api
+
+    def tearDown(self):
+        palette_axi.api, palette_axi.emit = self._api, self._emit
+        palette_axi.get_api_key, palette_axi.resolve_project = self._key, self._resolve
+
+    def _run(self, wide=False, min_cores=None, label=None):
+        args = type("A", (), {"tenant": "t", "project": "p", "wide": wide,
+                               "min_cores": min_cores, "label": label})()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            palette_axi.cmd_edgehosts(args)
+        return buf.getvalue()
+
+    def test_default_output_unchanged_no_wide_call(self):
+        out = self._run()
+        self.assertNotIn("/v1/edgehosts/host-1", [c[1] for c in self.calls],
+                         "default (no --wide, no filters) must never fetch per-host device data")
+        expected_rows = [{"name": "edge-01", "uid": "host-1", "state": "ready",
+                          "health": "healthy", "cluster": "c1"}]
+        expected = "\n".join([
+            "tenant=t project=proj-uid",
+            palette_axi.toon("edgehosts", ["name", "uid", "state", "health", "cluster"], expected_rows),
+            "\ncount:1 unhealthy:0 unassigned:0",
+        ]) + "\n"
+        self.assertEqual(out, expected)
+
+    def test_wide_adds_hardware_columns_via_per_host_fetch(self):
+        out = self._run(wide=True)
+        self.assertIn("/v1/edgehosts/host-1", [c[1] for c in self.calls],
+                      "spec.device absent from the search item -- must fall back to a GET")
+        self.assertIn("cores,memGB,disks,sanDisks,ip,secureBoot", out)
+        self.assertIn("96,768.0,2,1,10.0.0.9,true", out)
+
+    def test_min_cores_filters_and_reports_filtered_from(self):
+        out = self._run(min_cores=100)
+        self.assertIn("/v1/edgehosts/host-1", [c[1] for c in self.calls],
+                      "--min-cores needs the same device fetch --wide does")
+        self.assertIn("edgehosts[0]", out)
+        self.assertIn("filtered_from:1", out)
+
+    def test_label_filter_matches_kv(self):
+        out = self._run(label="env=prod")
+        self.assertIn("edgehosts[1]", out)
+        self.assertIn("filtered_from:1", out)
+        out2 = self._run(label="env=staging")
+        self.assertIn("edgehosts[0]", out2)
+        self.assertIn("filtered_from:1", out2)
+
+    def test_bad_label_syntax_exits_usage(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(label="no-equals-sign")
+        self.assertEqual(ctx.exception.code, palette_axi.E_USAGE)
 
 
 class TestProjectClusterCount(unittest.TestCase):
@@ -613,6 +982,7 @@ class TestHelpForEverySubcommand(unittest.TestCase):
         self.assertIn("cloudaccounts", verbs, "the new verb must be registered")
         self.assertIn("registries", verbs, "the new verb must be registered")
         self.assertIn("cloudconfig", verbs, "the new verb must be registered")
+        self.assertIn("edgehost", verbs, "the new verb must be registered")
 
         for verb in verbs:
             with self.subTest(verb=verb):
@@ -760,6 +1130,33 @@ class TestKeyCache(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, palette_axi.E_ERR, "the existing 401 exit code must not change")
         self.assertFalse(os.path.exists(self._key_path()), "a 401 must delete the cached key file it was serving")
+
+
+class TestApiReadTimeout(unittest.TestCase):
+    """A read timeout mid-body raises a bare TimeoutError, not URLError. Seen
+    live 9/21/26 on the loves tenant: it escaped as a raw traceback."""
+
+    def test_read_timeout_dies_cleanly_with_err_exit(self):
+        class SlowResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise TimeoutError("The read operation timed out")
+
+        real_urlopen = palette_axi.urllib.request.urlopen
+        palette_axi.urllib.request.urlopen = lambda *a, **k: SlowResp()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                palette_axi.api("GET", "/v1/dashboard/projects", "k")
+        finally:
+            palette_axi.urllib.request.urlopen = real_urlopen
+        self.assertEqual(ctx.exception.code, palette_axi.E_ERR)
+        self.assertIn("timeout after 30s reading GET /v1/dashboard/projects", err.getvalue())
 
 
 class TestKeyCacheDoctorRow(unittest.TestCase):
