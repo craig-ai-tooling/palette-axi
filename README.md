@@ -134,8 +134,14 @@ palette-axi clusters --project SA-Craig-Smith
 palette-axi clusters --project SA-Craig-Smith --edge      # edge-native only
 palette-axi cluster rpi-inference --project SA-Craig-Smith
 palette-axi cluster rpi-inference --project SA-Craig-Smith --full   # all conditions, not just non-True
+palette-axi cluster rpi-inference --project SA-Craig-Smith --profiles  # + attached profiles/pack tags
 palette-axi profiles --project SA-Craig-Smith
 palette-axi profile craig-nvidia --project SA-Craig-Smith
+palette-axi profile craig-nvidia --project SA-Craig-Smith --variables  # + declared variables
+palette-axi pack-values csi-portworx-generic 3.7.0 --project SA-Craig-Smith          # summary + presets
+palette-axi pack-values csi-portworx-generic 3.7.0 --project SA-Craig-Smith --registry 64eaff45  # disambiguate a pack in >1 registry
+palette-axi pack-values csi-portworx-generic 3.7.0 --project SA-Craig-Smith --values > values.yaml  # raw default values only
+palette-axi pack-values csi-portworx-generic 3.7.0 --project SA-Craig-Smith --preset px-normal-mode  # one preset's add/remove
 palette-axi edgehosts --project SA-Craig-Smith
 palette-axi edgehosts --project SA-Craig-Smith --wide       # + cores, memGB, disks, sanDisks, ip, secureBoot
 palette-axi edgehosts --project SA-Craig-Smith --min-cores 64
@@ -159,9 +165,10 @@ palette-axi registries "Public Repo"                       # describe one by nam
 |---|---|---|
 | `projects` | `GET /v1/projects` | Step 1 of every real session (47 combined refs); every other verb needs a ProjectUid resolved from a name. |
 | `clusters` | `POST /v1/dashboard/spectroclusters/search` | Plain `GET /v1/spectroclusters` list carries **no `status.health` at all** (confirmed live) — every session that wanted health went to this search endpoint instead. It's a POST because it takes a filter body, not because it mutates anything. |
-| `cluster` | `GET /v1/spectroclusters/{uid}` + `GET /v1/dashboard/spectroclusters/{uid}/overview` | Same health gap as above at the single-resource level; conditions come from the overview surface per the `spectrocloud-troubleshooting` skill's own debugging workflow. |
+| `cluster` | `GET /v1/spectroclusters/{uid}` + `GET /v1/dashboard/spectroclusters/{uid}/overview` | Same health gap as above at the single-resource level; conditions come from the overview surface per the `spectrocloud-troubleshooting` skill's own debugging workflow. `--profiles` adds a `profiles` and a `packs` table from `spec.clusterProfileTemplates[]` — already in the plain GET, so no extra call. Default output (no `--profiles`) is unchanged. See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `profiles` | `GET /v1/clusterprofiles` | 111+ direct refs; profile discovery precedes almost every profile-editing session. |
-| `profile` | `GET /v1/clusterprofiles/{uid}` | Layer/pack shape (`spec.published.packs[].tag`) confirmed against a real transcript that was diffing two profile versions. |
+| `profile` | `GET /v1/clusterprofiles/{uid}` | Layer/pack shape (`spec.published.packs[].tag`) confirmed against a real transcript that was diffing two profile versions. `--variables` adds one more call, `GET /v1/clusterprofiles/{uid}/variables`, for the profile's declared variables — a sensitive one's default always renders masked. Default output (no `--variables`) is unchanged. See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
+| `pack-values` | `GET /v1/packs/{packUid}?includePackValues=true` | A live 9/21/26 session needed a pack's default values YAML and a named preset's add/remove pair to build a storage layer, and had to drop to a raw urllib GET for both. Resolves the pack uid through the same `/v1/packs` search `packs` already uses; the same name+version can exist in more than one registry, so an ambiguous match dies `E_USAGE` listing every candidate `registryUid` — `--registry <uid-prefix>` disambiguates. `--values` prints only the raw default values YAML (redirectable); `--preset <name>` prints that preset's `add` YAML plus a `# remove:` comment block. See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `edgehosts` | `GET /v1/edgehosts` | 40+ refs; the field shapes match all three skills' documented `jq` filters verbatim. `--wide` adds hardware columns (cores, memGB, disks, sanDisks, ip, secureBoot) from `spec.device`; `--min-cores`/`--label` filter client-side. Default output (no `--wide`) is unchanged. |
 | `edgehost` | `GET /v1/edgehosts/{uid}` | An SE with a UID from a ticket or a name from a customer often doesn't have the project. Resolves the ref (uid/name/substring) against the same edge host search `edgehosts` uses, scoped to `--project` if given, else walks every project and reports which one matched. Prints the full hardware inventory: cpu/memory, OS, disks + partitions, NICs (virtual/container interfaces like `lxc*`/`cilium*`/`veth*`/`flannel*`/`cni*`/`docker*`/`kube-ipvs*`/`vxlan*`/`genev*`/`tunl*`/`lo` hidden by default, `--all-nics` to show them), gpu count. See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `cloudaccounts` | `GET /v1/cloudaccounts/summary` | Lists every cloud type (aws, azure, gcp, vsphere, maas, openstack, ...) in one call. Never hits a per-cloud endpoint — see [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below for why. |
@@ -280,6 +287,52 @@ skills:
   the metadata/status shape `edgehosts` has always rendered, is also
   unverified live — `--wide`'s per-host fallback GET exists for the case
   where it doesn't; see `_wide_fields()`'s docstring in `cli.py`.
+
+- **(9/21/26) `GET /v1/spectroclusters/{uid}` already carries `spec.
+  clusterProfileTemplates[]`** — the plain single-resource GET `cluster`
+  already made, no separate call needed. Each entry is
+  `{name, uid, type, profileVersion, packs[]{name, layer, tag}}`; a live
+  session found `profileVersion` populated on every attached profile, so
+  the `version` fallback `cluster --profiles` also checks (for symmetry
+  with `profile`'s own `spec.version`) was not itself exercised live.
+  Confirmed live against a cluster with 7 attached profiles (1 primary
+  `cluster`-type infra profile plus 6 `add-on`-type profiles) — output
+  matched a second, independently-verified direct GET on a different
+  cluster in the same fleet.
+- **(9/21/26) `GET /v1/packs/{packUid}?includePackValues=true` (with
+  `ProjectUid`) returns `packValues[0]`** — `{values` (the default values
+  YAML as a single string), `presets[]{name, group, label, add` (a second
+  YAML string), `remove` (a list of dotted paths to strip)`, readme,
+  schema}`. Confirmed live: a pack with 21 presets and a 182-line default
+  values document round-tripped exactly through `pack-values`'s summary,
+  `--values`, and `--preset` output. **The same pack name+version can
+  exist in more than one registry at once** (confirmed live on
+  `csi-portworx-generic 3.7.0` — two distinct `registryUid`s, same
+  version) — `pack-values` dies `E_USAGE` listing every candidate
+  registry uid rather than silently picking one.
+- **(9/21/26) `GET /v1/clusterprofiles/{uid}/variables` returns
+  `{variables:[{name, displayName, defaultValue, format, required,
+  immutable, hidden, isSensitive}]}`** — confirmed live against a profile
+  with 3 declared variables (two CIDRs, one enum-shaped string), none of
+  which happened to be `isSensitive`. `profile --variables` still masks
+  any `isSensitive` variable's `defaultValue` as `********`
+  unconditionally (not live-exercised on an actual sensitive variable this
+  session) — this tool never prints a value it can't confirm is safe to
+  print, the same rule `cloudaccounts` and `registries` already follow for
+  their own secret-shaped fields.
+- **(9/21/26) `list_clusters()`'s pagination cap (`max_pages=10` ×
+  `page_limit=50` = 500 rows) undercounts a project with more than 500
+  clusters** — confirmed live in a 505-cluster project: `clusters`
+  correctly printed the truncation `note:` (500 or fewer of 505, varying
+  run to run — the search endpoint's own pagination ordering isn't
+  stable), but `cluster <name>` resolving against that same incomplete
+  list means a cluster that lands outside the fetched page range is
+  reported as "no cluster matching" even though it exists. This predates
+  and is unrelated to `cluster --profiles` — the same failure reproduces
+  on plain `cluster <name>` with no flags. Not fixed here: raising
+  `max_pages` (or teaching `list_clusters` a server-side name filter) is a
+  behavior change to a verb this task didn't touch, out of scope for a
+  no-mistakes-mode change without its own dedicated evidence and review.
 
 Every list verb that can detect this (via `listmeta.count`) prints a `note:`
 line naming exactly how many rows it got vs. how many the API claims exist,

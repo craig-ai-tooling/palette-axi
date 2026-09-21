@@ -640,6 +640,27 @@ def cmd_cluster(a):
                   "controlPlane": p.get("controlPlane", False)} for p in pools]
         emit(toon("pools", ["name", "size", "controlPlane"], prows))
 
+    # --profiles: no extra API call -- spec.clusterProfileTemplates[] is already
+    # in `c` (the plain GET /v1/spectroclusters/{uid} above). Evidence: a live
+    # session on 9/21/26 needed which profiles/pack tags a
+    # cluster actually runs and had to drop to a raw urllib GET for it, because
+    # `cluster --full` shows state/conditions but never profile attachment.
+    # Each template carries name/uid/type and either profileVersion or version
+    # (fall back to the latter); packs[] is {name, layer, tag}. Gated behind
+    # the flag so the default `cluster` output stays byte-identical.
+    if a.profiles:
+        templates = sp.get("clusterProfileTemplates") or []
+        trows = [{"name": (t or {}).get("name"), "version": (t or {}).get("profileVersion") or (t or {}).get("version"),
+                  "type": (t or {}).get("type"), "uid": (t or {}).get("uid")} for t in templates]
+        emit(toon("profiles", ["name", "version", "type", "uid"], trows))
+        pkrows = []
+        for t in templates:
+            t = t or {}
+            for pk in (t.get("packs") or []):
+                pkrows.append({"profile": t.get("name"), "layer": pk.get("layer"),
+                                "name": pk.get("name"), "tag": pk.get("tag")})
+        emit(toon("packs", ["profile", "layer", "name", "tag"], pkrows))
+
     conds = ost.get("conditions") or []
     show = conds if a.full else [c2 for c2 in conds if c2.get("status") != "True"]
     crows = [{"type": c2.get("type"), "status": c2.get("status"),
@@ -685,6 +706,29 @@ def cmd_profile(a):
              for pk in packs]
     emit(toon("layers", ["name", "layer", "tag", "registryUid"], prows),
          f"\nlayerCount:{len(prows)}")
+
+    # --variables: one extra call, GET /v1/clusterprofiles/{uid}/variables ->
+    # {"variables":[{name, displayName, defaultValue, format, required,
+    # immutable, hidden, isSensitive}]}. Evidence: the same 9/21/26 live
+    # session needed a profile's declared variables (K8sPodCIDR etc.) and had
+    # to drop to a raw urllib GET for it. A sensitive variable's default is
+    # ALWAYS rendered as "********", never the underlying value, regardless of
+    # whether one is actually set -- this tool never prints a secret (see the
+    # API key and registry-auth handling elsewhere in this file for the same
+    # rule). Gated behind the flag so default `profile` output is unchanged.
+    if a.variables:
+        vdata = api("GET", f"/v1/clusterprofiles/{uid}/variables", key, proj)
+        variables = vdata.get("variables") or []
+        vrows = []
+        for v in variables:
+            v = v or {}
+            sensitive = bool(v.get("isSensitive"))
+            vrows.append({"name": v.get("name"), "default": "********" if sensitive else v.get("defaultValue"),
+                          "format": v.get("format"), "required": bool(v.get("required")),
+                          "immutable": bool(v.get("immutable")), "hidden": bool(v.get("hidden")),
+                          "sensitive": sensitive})
+        emit(toon("variables", ["name", "default", "format", "required", "immutable", "hidden", "sensitive"], vrows),
+             f"\nvariableCount:{len(vrows)}")
 
 
 SAN_VENDORS = {"PURE", "NETAPP", "EMC", "HITACHI", "IBM"}
@@ -1195,6 +1239,78 @@ def cmd_packs(a):
          nxt(f"palette-axi packs {a.name} --full") if hidden > 0 else "")
 
 
+# Evidence probed 9/21/26 live, why this verb resolves the pack uid through
+# the same /v1/packs search cmd_packs already uses rather than a name-only
+# lookup: the same name+version can exist in more than one registry at once
+# (confirmed live: csi-portworx-generic 3.7.0 existed in two registries in
+# one project) -- --registry disambiguates by a registryUid PREFIX so an
+# agent can paste the short id straight out of
+# the ambiguity error. GET /v1/packs/{packUid}?includePackValues=true (with
+# ProjectUid) returns packValues[0] = {values (default values YAML string),
+# presets[]{name, group, label, add (YAML string), remove (list of dotted
+# paths)}, readme, schema}. A live session had to drop to a raw urllib GET for
+# this to build a Portworx layer, needing both the full default values and one
+# named preset's add/remove pair.
+def _resolve_pack_uid(name, version, key, proj, registry_prefix):
+    items = list_all("/v1/packs", key, proj, filters=f"metadata.name={name}", page_limit=50, max_pages=10)
+    active = [p for p in items if not dget(p, "status").get("disabled")]
+    matches = [p for p in active if dget(p, "spec").get("version") == version]
+    if not matches:
+        die(f"no pack '{name}' version '{version}' found", E_NOTFOUND)
+    if registry_prefix:
+        matches = [p for p in matches
+                   if (dget(p, "spec").get("registryUid") or "").startswith(registry_prefix)]
+        if not matches:
+            die(f"no pack '{name}' version '{version}' in a registry matching '{registry_prefix}'", E_NOTFOUND)
+    if len(matches) > 1:
+        regs = sorted({dget(p, "spec").get("registryUid") for p in matches})
+        die(f"ambiguous pack '{name}' version '{version}': found in {len(regs)} registries "
+            f"({', '.join(regs)}) -- pass --registry <uid-prefix>", E_USAGE)
+    return matches[0]
+
+
+def cmd_pack_values(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    hit = _resolve_pack_uid(a.name, a.version, key, proj, a.registry)
+    uid = dget(hit, "metadata").get("uid")
+    registry_uid = dget(hit, "spec").get("registryUid")
+    data = api("GET", f"/v1/packs/{uid}", key, proj, {"includePackValues": "true"})
+    pv_list = data.get("packValues") or []
+    pv = pv_list[0] if pv_list else {}
+    values_yaml = pv.get("values") or ""
+    presets = pv.get("presets") or []
+
+    if a.values:
+        # Raw YAML to stdout and NOTHING else, so `> file.yaml` works.
+        print(values_yaml.rstrip("\n"))
+        return
+
+    if a.preset:
+        match = next((p for p in presets if (p or {}).get("name") == a.preset), None)
+        if not match:
+            names = ", ".join(sorted((p or {}).get("name", "") for p in presets)) or "(none)"
+            die(f"no preset '{a.preset}' on pack {a.name} {a.version} -- known presets: {names}", E_NOTFOUND)
+        print((match.get("add") or "").rstrip("\n"))
+        print("# remove:")
+        for r in match.get("remove") or []:
+            print(f"#   {r}")
+        return
+
+    lines = len(values_yaml.splitlines())
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("pack", ["name", "version", "uid", "registryUid", "lines", "presetCount"],
+              [{"name": a.name, "version": a.version, "uid": uid, "registryUid": registry_uid,
+                "lines": lines, "presetCount": len(presets)}]))
+    prows = [{"name": (p or {}).get("name"), "group": (p or {}).get("group"),
+              "removes": len((p or {}).get("remove") or [])} for p in presets]
+    emit(toon("presets", ["name", "group", "removes"], prows),
+         f"\npresetCount:{len(prows)}",
+         nxt(f"palette-axi pack-values {a.name} {a.version} --project {proj} --values",
+             f"palette-axi pack-values {a.name} {a.version} --project {proj} --preset <name>")
+         if prows else "")
+
+
 # ── doctor ─────────────────────────────────────────────────────────────
 # One table, in code, of every connector this tool depends on. Each probe
 # function returns {"need": "required"|"optional", "status": "ok"|"down"|
@@ -1354,6 +1470,9 @@ def main():
     s.add_argument("ref", help="cluster name or uid")
     s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
     s.add_argument("--full", action="store_true", help="show all conditions, not just non-True ones")
+    s.add_argument("--profiles", action="store_true",
+                   help="add profiles (name, version, type, uid) and packs (profile, layer, name, "
+                        "tag) tables from spec.clusterProfileTemplates -- no extra API call")
     s.set_defaults(fn=cmd_cluster)
 
     s = sub.add_parser("profiles", help="list cluster profiles in a project")
@@ -1364,6 +1483,10 @@ def main():
     s.add_argument("ref", help="profile name or uid")
     s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
     s.add_argument("--full", action="store_true", help="untruncated registry uids")
+    s.add_argument("--variables", action="store_true",
+                   help="add a variables table (name, default, format, required, immutable, "
+                        "hidden, sensitive) from GET /v1/clusterprofiles/{uid}/variables; a "
+                        "sensitive variable's default always renders as ********")
     s.set_defaults(fn=cmd_profile)
 
     s = sub.add_parser("edgehosts", help="list edge hosts (state, health, cluster) in a project")
@@ -1426,6 +1549,18 @@ def main():
     s.add_argument("--project", help="project name or uid (optional; not required by /v1/packs)")
     s.add_argument("--full", action="store_true", help="show every version, not just the newest 12")
     s.set_defaults(fn=cmd_packs)
+
+    s = sub.add_parser("pack-values",
+                        help="show a pack's default values YAML and presets (GET .../packs/{uid}?includePackValues=true)")
+    s.add_argument("name", help="pack metadata.name, e.g. csi-portworx-generic")
+    s.add_argument("version", help="exact pack version, e.g. 3.7.0")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--registry", help="registry uid prefix -- disambiguates when the same "
+                                       "name+version exists in more than one registry")
+    s.add_argument("--values", action="store_true",
+                   help="print only the raw default values YAML to stdout (nothing else -- safe to redirect)")
+    s.add_argument("--preset", help="print only this preset's add YAML plus a '# remove:' comment block")
+    s.set_defaults(fn=cmd_pack_values)
 
     s = sub.add_parser("doctor", help="check whether 1Password and the Palette API are usable")
     s.add_argument("--json", action="store_true", help="emit JSON instead of TOON")
