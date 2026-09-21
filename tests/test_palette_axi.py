@@ -7,8 +7,15 @@ what "ACTUALLY RUN IT" in the build task covered, live, against custeng-prod.
 import argparse
 import contextlib
 import io
+import json
+import os
+import shutil
+import stat
 import sys
+import tempfile
+import time
 import unittest
+import urllib.error
 
 from palette_axi import cli as palette_axi
 
@@ -617,3 +624,249 @@ class TestHelpForEverySubcommand(unittest.TestCase):
                     self.assertEqual(ctx.exception.code, 0)
                 finally:
                     sys.argv = old_argv
+
+
+class TestKeyCache(unittest.TestCase):
+    """Per-tenant API key + item-id cache in $XDG_RUNTIME_DIR/palette-axi.
+
+    9/21/26 16:53Z: the shared 1Password service account started refusing
+    item reads with "Too many requests. Your client has been rate-limited."
+    Every palette-axi verb spends 2 op calls (op item list, then op item
+    get) getting a key it already resolved a moment ago -- an agent running
+    dozens of verbs in a few minutes burns the limit fast. This cache cuts
+    that to at most one op call per TTL window, not per invocation. `op`
+    itself is stubbed out (this module runs no real 1Password calls, per
+    AGENTS.md's "offline tests" rule) and XDG_RUNTIME_DIR points at a temp
+    dir so nothing here touches a real tmpfs or a real cache from another
+    session."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="palette-axi-test-")
+        self._saved_env = {k: os.environ.get(k) for k in
+                            ("XDG_RUNTIME_DIR", "PALETTE_AXI_KEY_TTL",
+                             "PALETTE_API_KEY", "PALETTE_AXI_OP_ITEM")}
+        os.environ["XDG_RUNTIME_DIR"] = self.tmp
+        for k in ("PALETTE_AXI_KEY_TTL", "PALETTE_API_KEY", "PALETTE_AXI_OP_ITEM"):
+            os.environ.pop(k, None)
+
+        self.list_calls = 0
+        self.get_calls = 0
+
+        def fake_item_id(tenant):
+            self.list_calls += 1
+            return "item-123"
+
+        def fake_secret(item_id):
+            self.get_calls += 1
+            return "secret-abc"
+
+        self._real_item_id = palette_axi._op_item_id_for_tenant
+        self._real_secret = palette_axi._op_secret_value
+        palette_axi._op_item_id_for_tenant = fake_item_id
+        palette_axi._op_secret_value = fake_secret
+        palette_axi._LAST_KEY_CACHE_PATH = None
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        palette_axi._op_item_id_for_tenant = self._real_item_id
+        palette_axi._op_secret_value = self._real_secret
+        palette_axi._LAST_KEY_CACHE_PATH = None
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _key_path(self, tenant="acme"):
+        return os.path.join(self.tmp, "palette-axi", palette_axi._key_cache_name(tenant))
+
+    def _item_path(self, tenant="acme"):
+        return os.path.join(self.tmp, "palette-axi", palette_axi._item_cache_name(tenant))
+
+    def test_cache_hit_makes_zero_op_calls(self):
+        palette_axi.get_api_key("acme")  # cold: writes both caches
+        self.list_calls = self.get_calls = 0
+        key = palette_axi.get_api_key("acme")
+        self.assertEqual(key, "secret-abc")
+        self.assertEqual((self.list_calls, self.get_calls), (0, 0),
+                          "a warm key cache must not call op at all")
+
+    def test_key_miss_with_warm_item_cache_costs_one_op_call(self):
+        palette_axi.get_api_key("acme")  # warms both caches
+        os.unlink(self._key_path())  # force a key-cache miss only
+        self.list_calls = self.get_calls = 0
+        key = palette_axi.get_api_key("acme")
+        self.assertEqual(key, "secret-abc")
+        self.assertEqual(self.list_calls, 0, "the item-id cache should have stayed warm")
+        self.assertEqual(self.get_calls, 1, "a key miss still needs exactly one item-get call")
+
+    def test_ttl_expiry_refetches(self):
+        os.environ["PALETTE_AXI_KEY_TTL"] = "1"
+        palette_axi.get_api_key("acme")
+        old = time.time() - 10  # back-date past the 1s TTL instead of sleeping
+        os.utime(self._key_path(), (old, old))
+        self.list_calls = self.get_calls = 0
+        key = palette_axi.get_api_key("acme")
+        self.assertEqual(key, "secret-abc")
+        self.assertEqual(self.get_calls, 1, "an expired cache entry must not be reused")
+
+    def test_dir_and_file_modes(self):
+        palette_axi.get_api_key("acme")
+        d = os.path.join(self.tmp, "palette-axi")
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(self._key_path()).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self._item_path()).st_mode), 0o600)
+
+    def test_no_xdg_runtime_dir_means_no_file_written(self):
+        del os.environ["XDG_RUNTIME_DIR"]
+        key = palette_axi.get_api_key("acme")
+        self.assertEqual(key, "secret-abc", "must still resolve a key, just not cache it")
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "palette-axi")))
+
+    def test_ttl_zero_disables_caching(self):
+        os.environ["PALETTE_AXI_KEY_TTL"] = "0"
+        palette_axi.get_api_key("acme")
+        self.assertFalse(os.path.exists(self._key_path()), "TTL=0 must not write a key cache file")
+        self.list_calls = self.get_calls = 0
+        palette_axi.get_api_key("acme")
+        self.assertEqual(self.get_calls, 1, "TTL=0 must re-fetch the key every call")
+
+    def test_palette_api_key_still_wins_and_skips_the_cache(self):
+        os.environ["PALETTE_API_KEY"] = "env-key"
+        key = palette_axi.get_api_key("acme")
+        self.assertEqual(key, "env-key")
+        self.assertEqual((self.list_calls, self.get_calls), (0, 0), "op must never run when the env key is set")
+        self.assertFalse(os.path.exists(self._key_path()), "the env key must never be written to disk")
+
+    def test_401_deletes_the_cached_key_file(self):
+        palette_axi.get_api_key("acme")  # warm the cache
+        self.assertTrue(os.path.exists(self._key_path()))
+        self.list_calls = self.get_calls = 0
+        cached_key = palette_axi.get_api_key("acme")  # served from cache
+        self.assertEqual(self.get_calls, 0, "sanity check: this call must be a cache hit")
+
+        def raise_401(*a, **k):
+            raise urllib.error.HTTPError(
+                "https://api.spectrocloud.com/v1/projects", 401, "Unauthorized",
+                {}, io.BytesIO(b'{"message":"invalid api key"}'))
+
+        real_urlopen = palette_axi.urllib.request.urlopen
+        palette_axi.urllib.request.urlopen = raise_401
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                palette_axi.api("GET", "/v1/projects", cached_key)
+        finally:
+            palette_axi.urllib.request.urlopen = real_urlopen
+
+        self.assertEqual(ctx.exception.code, palette_axi.E_ERR, "the existing 401 exit code must not change")
+        self.assertFalse(os.path.exists(self._key_path()), "a 401 must delete the cached key file it was serving")
+
+
+class TestKeyCacheDoctorRow(unittest.TestCase):
+    """`doctor`'s config table gets one row for key-cache state -- never a
+    new connector, never the key value itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="palette-axi-test-")
+        self._saved_env = {k: os.environ.get(k) for k in
+                            ("XDG_RUNTIME_DIR", "PALETTE_AXI_KEY_TTL", "PALETTE_API_KEY")}
+        os.environ["XDG_RUNTIME_DIR"] = self.tmp
+        for k in ("PALETTE_AXI_KEY_TTL", "PALETTE_API_KEY"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _write_key_cache(self, tenant, value):
+        d = os.path.join(self.tmp, "palette-axi")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with open(os.path.join(d, palette_axi._key_cache_name(tenant)), "w") as f:
+            json.dump(value, f)
+
+    def test_miss_when_no_cache_file(self):
+        self.assertEqual(palette_axi._key_cache_status("acme"), "miss")
+
+    def test_hit_reports_age(self):
+        self._write_key_cache("acme", {"key": "x"})
+        status = palette_axi._key_cache_status("acme")
+        self.assertTrue(status.startswith("hit (age "), status)
+
+    def test_disabled_when_ttl_zero(self):
+        os.environ["PALETTE_AXI_KEY_TTL"] = "0"
+        self.assertIn("disabled", palette_axi._key_cache_status("acme"))
+
+    def test_disabled_when_palette_api_key_set(self):
+        os.environ["PALETTE_API_KEY"] = "x"
+        self.assertIn("disabled", palette_axi._key_cache_status("acme"))
+
+    def test_disabled_when_no_xdg_runtime_dir(self):
+        del os.environ["XDG_RUNTIME_DIR"]
+        self.assertIn("disabled", palette_axi._key_cache_status("acme"))
+
+    def test_status_never_contains_the_key_value(self):
+        self._write_key_cache("acme", {"key": "super-secret-value"})
+        status = palette_axi._key_cache_status("acme")
+        self.assertNotIn("super-secret-value", status)
+
+    def test_config_rows_includes_key_cache_row_without_the_secret(self):
+        self._write_key_cache("acme", {"key": "super-secret-value"})
+        rows = palette_axi._config_rows("acme")
+        cache_row = next((r for r in rows if r["var"] == "key cache"), None)
+        self.assertIsNotNone(cache_row, "expected a 'key cache' row in the config table")
+        self.assertNotIn("super-secret-value", json.dumps(rows))
+        ttl_row = next((r for r in rows if r["var"] == "PALETTE_AXI_KEY_TTL"), None)
+        self.assertIsNotNone(ttl_row, "expected a PALETTE_AXI_KEY_TTL row in the config table")
+
+
+class TestOpRateLimit(unittest.TestCase):
+    """9/21/26 16:53Z: the shared 1Password service account started refusing
+    item reads with 'Too many requests. Your client has been rate-limited.'
+    and every verb died on an op failure that read identically to any other
+    op error (bad vault, typo'd item, `op` logged out). die() now names the
+    cause and the escape hatch instead."""
+
+    def setUp(self):
+        self._run = palette_axi._run
+
+    def tearDown(self):
+        palette_axi._run = self._run
+
+    def _stub(self, stderr):
+        def fake_run(cmd, timeout=30, input_text=None):
+            return type("P", (), {"returncode": 1, "stdout": "", "stderr": stderr})()
+        palette_axi._run = fake_run
+
+    def test_item_list_rate_limit_message(self):
+        self._stub("[ERROR] 2026/09/21 16:53:02 Too many requests. "
+                    "Your client has been rate-limited.")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                palette_axi._op_item_id_for_tenant("loves")
+        self.assertEqual(ctx.exception.code, palette_axi.E_ERR, "exit code must not change")
+        err = buf.getvalue()
+        self.assertIn("rate-limited", err)
+        self.assertIn("PALETTE_API_KEY", err)
+
+    def test_item_get_rate_limit_message(self):
+        self._stub("[ERROR] Too many requests. Your client has been rate-limited.")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                palette_axi._op_secret_value("item-123")
+        self.assertEqual(ctx.exception.code, palette_axi.E_ERR)
+        self.assertIn("rate-limited", buf.getvalue())
+        self.assertIn("PALETTE_API_KEY", buf.getvalue())
+
+    def test_non_rate_limit_op_failure_keeps_the_plain_message(self):
+        self._stub("[ERROR] 401: Authentication required.")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit):
+                palette_axi._op_item_id_for_tenant("loves")
+        self.assertNotIn("rate-limited", buf.getvalue())
