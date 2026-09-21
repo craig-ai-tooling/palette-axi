@@ -423,7 +423,14 @@ def api(method, path, api_key, project=None, params=None, json_body=None, timeou
         die(f"timeout after {timeout}s reading {method} {path} — Palette was slow; retry")
 
 
-def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=10,
+# The page loops below stop on their own: a short page, no continue token, or a
+# page with no new uids. MAX_PAGES is only a runaway guard. It was 10 (500 rows)
+# until 9/21/26, when a real project passed 500 clusters (506) and `cluster
+# <name>` answered "no cluster matching" for a cluster that exists.
+MAX_PAGES = 100
+
+
+def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=MAX_PAGES,
              method="GET", json_body=None):
     """Page via listmeta.continue when the endpoint returns one — confirmed live
     that's the stable mechanism (packs, clusterprofiles). Raw offset increments
@@ -483,7 +490,7 @@ def truncation_note():
             "full list; some rows may be missing." if LAST_LIST_TRUNCATED else "")
 
 
-def list_clusters(api_key, project, page_limit=50, max_pages=10):
+def list_clusters(api_key, project, page_limit=50, max_pages=MAX_PAGES):
     """GET /v1/spectroclusters carries no status.health at all — confirmed live.
     The health field only comes back from the dashboard search/overview surface,
     which real sessions reached for exactly this reason. This is a POST (it takes

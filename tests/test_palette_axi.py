@@ -1132,6 +1132,35 @@ class TestKeyCache(unittest.TestCase):
         self.assertFalse(os.path.exists(self._key_path()), "a 401 must delete the cached key file it was serving")
 
 
+class TestListClustersPastFiveHundred(unittest.TestCase):
+    """A project with 506 clusters must list all 506. The old 10-page cap
+    stopped at 500 and `cluster <name>` missed real clusters (live 9/21/26)."""
+
+    def test_list_clusters_follows_continue_past_500_rows(self):
+        total, page = 506, 50
+        calls = []
+
+        def fake_api(method, path, key, project=None, params=None, json_body=None, timeout=30):
+            calls.append((method, path, dict(params or {})))
+            start = int((params or {}).get("continue") or 0)
+            rows = [{"metadata": {"uid": f"u{i}", "name": f"store-{i:04d}"}}
+                    for i in range(start, min(start + page, total))]
+            nxt = start + page
+            return {"items": rows,
+                    "listmeta": {"count": total, "continue": str(nxt) if nxt < total else ""}}
+
+        real_api = palette_axi.api
+        palette_axi.api = fake_api
+        try:
+            items = palette_axi.list_clusters("k", "proj")
+        finally:
+            palette_axi.api = real_api
+        self.assertEqual(len(items), 506)
+        self.assertEqual(len(calls), 11)
+        self.assertTrue(all(c[:2] == ("POST", "/v1/dashboard/spectroclusters/search") for c in calls))
+        self.assertFalse(palette_axi.LAST_LIST_TRUNCATED)
+
+
 class TestApiReadTimeout(unittest.TestCase):
     """A read timeout mid-body raises a bare TimeoutError, not URLError. Seen
     live 9/21/26 on the loves tenant: it escaped as a raw traceback."""
