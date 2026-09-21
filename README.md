@@ -62,9 +62,38 @@ make build                        # writes dist/palette-axi.pyz
 | `PALETTE_AXI_TENANT` | `custeng-prod` | No |
 | `PALETTE_AXI_VAULT` | `Lobster` | No |
 | `PALETTE_AXI_OP_ITEM` | (none) | No — skips tenant→item-id lookup when set |
+| `PALETTE_AXI_KEY_TTL` | `900` | No — seconds the resolved key is cached; `0` disables caching |
 | `PALETTE_PROJECT` | (none) | No — most verbs also accept `--project` |
 
 `palette-axi doctor` tells you what is still missing.
+
+### Key cache
+
+Every verb used to cost **two** 1Password calls (`op item list` to resolve
+the tenant's item id, then `op item get` for the secret) even though the
+mapping and the key rarely change between calls. On 9/21/26 the shared
+1Password service account started rate-limiting reads
+(`Too many requests. Your client has been rate-limited.`), and an agent
+running a few dozen verbs in a row burned through the limit fast.
+
+`palette-axi` now caches both under `$XDG_RUNTIME_DIR/palette-axi/`
+(tmpfs, per-user, gone at logout — never a persistent path like `~/.cache`):
+
+- The resolved **API key**, for `$PALETTE_AXI_KEY_TTL` seconds (default 900;
+  `0` disables caching entirely). Cache key is the tenant name plus
+  `$PALETTE_AXI_OP_ITEM` when set, so different overrides never collide.
+- The **tenant → 1Password item id** mapping (not a secret), for 24h. This
+  means even a key-cache miss costs one `op` call, not two.
+
+If `$XDG_RUNTIME_DIR` is unset or not a writable directory, caching is
+disabled outright — `palette-axi` never falls back to a persistent location
+for a secret. If the Palette API answers `401` to a request made with a
+cached key, that cache file is deleted before the command exits, so the next
+run re-reads 1Password instead of retrying a stale key forever.
+
+`palette-axi doctor` shows the cache state for the active tenant (`hit (age
+Ns)`, `miss`, or `disabled (<why>)`) in its config table — it never prints
+the key itself.
 
 ### The op item-ID gotcha
 
@@ -246,6 +275,7 @@ Matches `opp-axi`'s contract so both tools compose in the same agent loop:
 | `PALETTE_AXI_TENANT` | `custeng-prod` | Default `--tenant` |
 | `PALETTE_AXI_VAULT` | `Lobster` | 1Password vault |
 | `PALETTE_AXI_OP_ITEM` | (none) | Skip tenant→item-id lookup, use this op item id directly |
+| `PALETTE_AXI_KEY_TTL` | `900` | Seconds the resolved API key is cached in `$XDG_RUNTIME_DIR/palette-axi`; `0` disables caching |
 
 ## Future work (not implemented)
 

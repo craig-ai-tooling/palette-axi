@@ -25,7 +25,14 @@ candidates — this tool never guesses which project you meant.
 
 Env overrides: PALETTE_API_KEY, PALETTE_PROJECT, PALETTE_AXI_TENANT,
 PALETTE_AXI_VAULT (default Lobster), PALETTE_AXI_OP_ITEM (skip tenant
-resolution and use this 1Password item id directly).
+resolution and use this 1Password item id directly), PALETTE_AXI_KEY_TTL
+(seconds the resolved API key is cached in $XDG_RUNTIME_DIR/palette-axi;
+default 900, 0 disables caching).
+
+The resolved API key (and the tenant->1Password-item-id mapping) is cached
+under $XDG_RUNTIME_DIR/palette-axi so an agent running many verbs back to
+back spends at most one `op` call total, not two per verb -- see
+get_api_key()'s docstring for the incident that motivated this.
 
 Run `palette-axi doctor` to check whether those connectors are configured.
 """
@@ -39,6 +46,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +55,14 @@ API_BASE = "https://api.spectrocloud.com"
 DEFAULT_TENANT = os.environ.get("PALETTE_AXI_TENANT", "custeng-prod")
 OP_VAULT = os.environ.get("PALETTE_AXI_VAULT", "Lobster")
 UID_RE = re.compile(r"^[0-9a-f]{24}$")
+# 9/21/26 16:53Z: the shared 1Password service account started refusing item
+# reads with "Too many requests. Your client has been rate-limited." An agent
+# doing an inventory runs dozens of verbs in a few minutes, and every verb
+# spent 2 op calls (item list + item get) re-fetching a key it already knew,
+# so it burned the limit fast. These two caches cut that to at most one op
+# call per TTL window, not per invocation.
+KEY_CACHE_TTL_DEFAULT = 900  # seconds; override with $PALETTE_AXI_KEY_TTL (0 disables)
+ITEM_CACHE_TTL = 24 * 60 * 60  # tenant -> op item id is not a secret and rarely changes
 
 # Exit codes — mirrors opp-axi's contract so both tools compose in the same
 # pipeline/agent loop without the caller needing two different tables.
@@ -141,12 +157,25 @@ def _run(cmd, timeout=30, input_text=None):
         die(f"not found on PATH: {cmd[0]}")
 
 
+def _op_die(msg, stderr_text, code=E_ERR):
+    """Both op call sites below hit the same failure mode when the shared
+    service account is rate-limited (confirmed live 9/21/26: every verb died
+    on 'Too many requests. Your client has been rate-limited.' with no other
+    signal) -- name that cause once here instead of a generic op error that
+    reads identically to a bad vault, a typo'd item, or `op` being logged out."""
+    if "too many requests" in (stderr_text or "").lower():
+        die(f"{msg} -- the shared 1Password service account is rate-limited. "
+            "Set PALETTE_API_KEY=<key> to bypass 1Password, or wait and retry.", code)
+    die(msg, code)
+
+
 def _op_item_id_for_tenant(tenant):
     """'Palette API Key (<tenant>)' -> item id, via `op item list` (never op:// —
     titles with parens break that syntax). Service accounts need --vault explicit."""
     p = _run(["op", "item", "list", "--vault", OP_VAULT, "--format", "json"], timeout=20)
     if p.returncode != 0:
-        die(f"op item list --vault {OP_VAULT} failed: {(p.stderr or '').strip()[:300]}")
+        stderr = (p.stderr or "").strip()
+        _op_die(f"op item list --vault {OP_VAULT} failed: {stderr[:300]}", stderr)
     try:
         items = json.loads(p.stdout or "[]")
     except json.JSONDecodeError:
@@ -172,7 +201,8 @@ def _op_secret_value(item_id):
     'credential' inconsistently — check both rather than assuming one."""
     p = _run(["op", "item", "get", item_id, "--vault", OP_VAULT, "--format", "json"], timeout=20)
     if p.returncode != 0:
-        die(f"op item get {item_id} --vault {OP_VAULT} failed: {(p.stderr or '').strip()[:300]}")
+        stderr = (p.stderr or "").strip()
+        _op_die(f"op item get {item_id} --vault {OP_VAULT} failed: {stderr[:300]}", stderr)
     try:
         d = json.loads(p.stdout or "{}")
     except json.JSONDecodeError:
@@ -187,12 +217,167 @@ def _op_secret_value(item_id):
     die(f"item {item_id} has no password/credential field with a value", E_ERR)
 
 
+def _sanitize_cache_component(s):
+    """A tenant name (or op item id) about to become a filename -- keep it to
+    a safe character set instead of trusting whatever --tenant carried."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s or "") or "_"
+
+
+def _key_cache_name(tenant):
+    name = "key-" + _sanitize_cache_component(tenant)
+    op_item = os.environ.get("PALETTE_AXI_OP_ITEM")
+    if op_item:
+        # A different PALETTE_AXI_OP_ITEM points at a different 1Password item
+        # (possibly a different tenant's key) -- it must not collide on cache.
+        name += "-" + _sanitize_cache_component(op_item)
+    return name + ".json"
+
+
+def _item_cache_name(tenant):
+    return "item-" + _sanitize_cache_component(tenant) + ".json"
+
+
+def _cache_dir():
+    """$XDG_RUNTIME_DIR/palette-axi -- tmpfs, per-user, gone at logout. Never
+    falls back to a persistent path like ~/.cache: that would leave a copy of
+    the Palette API key on disk after the session ends. No usable
+    XDG_RUNTIME_DIR means no caching at all, not a different location."""
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
+        return None
+    d = os.path.join(base, "palette-axi")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)  # makedirs' mode is masked by umask -- enforce it
+    except OSError:
+        return None
+    return d
+
+
+def _key_ttl():
+    raw = os.environ.get("PALETTE_AXI_KEY_TTL")
+    if raw is None or raw == "":
+        return KEY_CACHE_TTL_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return KEY_CACHE_TTL_DEFAULT
+
+
+def _cache_read(name, ttl):
+    """The cached dict if `name` exists and is within `ttl` seconds old, else
+    None. ttl<=0 always misses -- the caller decides whether that means
+    "disabled" or merely "expired"."""
+    if ttl <= 0:
+        return None
+    d = _cache_dir()
+    if not d:
+        return None
+    path = os.path.join(d, name)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > ttl:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _cache_write(name, value):
+    """Write mode 0600 regardless of umask -- os.open's mode argument alone
+    is masked by it, a permissive umask would otherwise loosen the file.
+    Best-effort: a failed cache write must never break a command that
+    already has its key."""
+    d = _cache_dir()
+    if not d:
+        return
+    path = os.path.join(d, name)
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+def _cached_item_id_for_tenant(tenant):
+    """Wraps _op_item_id_for_tenant with a 24h cache. The tenant -> item-id
+    mapping is not a secret and barely ever changes, so even a key-cache miss
+    should cost one `op` call (item get), not two (item list + item get)."""
+    name = _item_cache_name(tenant)
+    cached = _cache_read(name, ITEM_CACHE_TTL)
+    if cached and cached.get("item_id"):
+        return cached["item_id"]
+    item_id = _op_item_id_for_tenant(tenant)
+    _cache_write(name, {"item_id": item_id})
+    return item_id
+
+
+def _key_cache_status(tenant):
+    """doctor-only: reports cache state without ever touching 1Password, the
+    Palette API, or printing the key's value."""
+    if os.environ.get("PALETTE_API_KEY"):
+        return "disabled (PALETTE_API_KEY set)"
+    ttl = _key_ttl()
+    if ttl <= 0:
+        return "disabled (PALETTE_AXI_KEY_TTL=0)"
+    d = _cache_dir()
+    if not d:
+        base = os.environ.get("XDG_RUNTIME_DIR")
+        why = "XDG_RUNTIME_DIR unset" if not base else f"{base} not a writable directory"
+        return f"disabled ({why})"
+    path = os.path.join(d, _key_cache_name(tenant))
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "miss"
+    age = int(time.time() - st.st_mtime)
+    if age > ttl:
+        return "miss"
+    return f"hit (age {age}s)"
+
+
+# Full path of the cache file the current api_key was served from, if any.
+# api() deletes it on a 401 so the next run re-reads 1Password instead of
+# retrying a stale/revoked key forever. Set by get_api_key(), read by api().
+_LAST_KEY_CACHE_PATH = None
+
+
 def get_api_key(tenant):
+    """PALETTE_API_KEY always wins and never touches the cache. Otherwise: a
+    cached key (see module docstring for why this cache exists) if one is
+    fresh, else 1Password by way of a possibly-cached tenant->item-id
+    mapping -- at most one `op` call either way, not two."""
+    global _LAST_KEY_CACHE_PATH
+    _LAST_KEY_CACHE_PATH = None
     env_key = os.environ.get("PALETTE_API_KEY")
     if env_key:
         return env_key
-    item_id = os.environ.get("PALETTE_AXI_OP_ITEM") or _op_item_id_for_tenant(tenant)
-    return _op_secret_value(item_id)
+
+    ttl = _key_ttl()
+    key_name = _key_cache_name(tenant)
+    if ttl > 0:
+        cached = _cache_read(key_name, ttl)
+        if cached and cached.get("key"):
+            d = _cache_dir()
+            if d:
+                _LAST_KEY_CACHE_PATH = os.path.join(d, key_name)
+            return cached["key"]
+
+    item_id = os.environ.get("PALETTE_AXI_OP_ITEM") or _cached_item_id_for_tenant(tenant)
+    key = _op_secret_value(item_id)
+
+    if ttl > 0:
+        _cache_write(key_name, {"key": key})
+    return key
 
 
 # ── Palette API ──────────────────────────────────────────────────────────
@@ -221,6 +406,12 @@ def api(method, path, api_key, project=None, params=None, json_body=None, timeou
             msg = j.get("message") or j.get("error") or str(j)[:300]
         except Exception:
             msg = body.decode(errors="replace")[:300] or e.reason
+        if e.code == 401 and _LAST_KEY_CACHE_PATH:
+            # A cached key the API now rejects is worse than no cache at all —
+            # every call would die the same way until someone clears it by
+            # hand. Delete it so the next run re-reads 1Password.
+            with contextlib.suppress(OSError):
+                os.unlink(_LAST_KEY_CACHE_PATH)
         code = E_NOTFOUND if e.code == 404 else E_ERR
         die(f"{method} {path} -> HTTP {e.code}: {msg}", code)
     except urllib.error.URLError as e:
@@ -916,6 +1107,10 @@ def _config_rows(tenant):
 
     op_item = os.environ.get("PALETTE_AXI_OP_ITEM")
     rows.append(row("PALETTE_AXI_OP_ITEM", op_item or "", "env" if op_item else "unset"))
+
+    ttl_env = os.environ.get("PALETTE_AXI_KEY_TTL")
+    rows.append(row("PALETTE_AXI_KEY_TTL", str(_key_ttl()), "env" if ttl_env else "default"))
+    rows.append(row("key cache", _key_cache_status(tenant), tenant))
 
     return rows
 
