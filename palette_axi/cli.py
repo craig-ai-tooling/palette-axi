@@ -682,6 +682,47 @@ def cmd_profile(a):
          f"\nlayerCount:{len(prows)}")
 
 
+SAN_VENDORS = {"PURE", "NETAPP", "EMC", "HITACHI", "IBM"}
+
+# Hidden-by-default noise on a real edge host's NIC list -- a live 28-nic host
+# had ~4 physical/bond/vlan interfaces and the rest were container/CNI
+# plumbing. --all-nics (on `edgehost`) shows everything.
+_VIRTUAL_NIC_PREFIXES = ("lxc", "cilium", "veth", "flannel", "cni", "docker",
+                          "kube-ipvs", "vxlan", "genev", "tunl")
+
+
+def _is_virtual_nic(name):
+    n = (name or "").lower()
+    return n == "lo" or n.startswith(_VIRTUAL_NIC_PREFIXES)
+
+
+def _wide_fields(item, key, proj, uid):
+    """cores/memGB/disks/sanDisks/ip/secureBoot all live under spec.device on the
+    single-resource GET. UNVERIFIED LIVE: whether the edgehosts SEARCH response
+    (the `item` this function receives, from list_all against EDGEHOSTS_PATH)
+    already carries spec.device inline, or only the metadata/status shape
+    `edgehosts` has always rendered. Try the item first -- costs nothing extra
+    if it's there -- and only fall back to one GET /v1/edgehosts/{uid} per host
+    (sequential, bounded by the row count) when spec.device is empty.
+
+    sanDisks is a vendor-name heuristic (PURE/NETAPP/EMC/HITACHI/IBM against
+    disk.vendor, case-insensitive) -- not a real SAN/LUN protocol check. A disk
+    from an unlisted SAN vendor will not be counted; see --wide's help text."""
+    dev = dget(dget(item, "spec"), "device")
+    host = dget(dget(item, "spec"), "host")
+    if not dev:
+        full = api("GET", f"/v1/edgehosts/{uid}", key, proj)
+        dev = dget(dget(full, "spec"), "device")
+        host = dget(dget(full, "spec"), "host")
+    cores = dget(dev, "cpu").get("cores")
+    mem_mb = dget(dev, "memory").get("sizeInMB")
+    mem_gb = round(mem_mb / 1024, 1) if isinstance(mem_mb, (int, float)) else None
+    disks = dev.get("disks") or []
+    san = sum(1 for d in disks if (d.get("vendor") or "").upper() in SAN_VENDORS)
+    return {"cores": cores, "memGB": mem_gb, "disks": len(disks), "sanDisks": san,
+            "ip": host.get("hostAddress"), "secureBoot": dev.get("secureBoot")}
+
+
 def cmd_edgehosts(a):
     key = get_api_key(a.tenant)
     proj = resolve_project(a.project, key)
@@ -695,13 +736,162 @@ def cmd_edgehosts(a):
         # 2-node hosts can each show the same cluster.
         in_use = st.get("inUseClusters") or []
         cluster = ", ".join(c.get("name", "") for c in in_use)
+        # _labels/_item are carried for --min-cores/--label filtering and the
+        # --wide fetch below; toon() only ever reads the columns in `fields`,
+        # so these extra keys never touch the default (no-wide, no-filter)
+        # output -- that path must stay byte-identical to before this change.
         rows.append({"name": m.get("name"), "uid": m.get("uid"), "state": st.get("state"),
-                     "health": dget(st, "health").get("state"), "cluster": cluster})
+                     "health": dget(st, "health").get("state"), "cluster": cluster,
+                     "_labels": dget(m, "labels"), "_item": h})
+
+    if a.wide or a.min_cores is not None:
+        for r in rows:
+            r.update(_wide_fields(r["_item"], key, proj, r["uid"]))
+
+    total = len(rows)
+    filtered = False
+    if a.min_cores is not None:
+        filtered = True
+        rows = [r for r in rows if isinstance(r.get("cores"), int) and r["cores"] >= a.min_cores]
+    if a.label:
+        if "=" not in a.label:
+            die(f"--label must be key=value, got '{a.label}'", E_USAGE)
+        filtered = True
+        lk, lv = a.label.split("=", 1)
+        rows = [r for r in rows if (r.get("_labels") or {}).get(lk) == lv]
+
+    fields = ["name", "uid", "state", "health", "cluster"]
+    if a.wide:
+        fields = fields + ["cores", "memGB", "disks", "sanDisks", "ip", "secureBoot"]
+
     unhealthy = sum(1 for r in rows if is_unhealthy(r["health"]))
     unassigned = sum(1 for r in rows if not r["cluster"])
+    filtered_note = f" filtered_from:{total}" if filtered else ""
     emit(f"tenant={a.tenant} project={proj}",
-         toon("edgehosts", ["name", "uid", "state", "health", "cluster"], rows),
-         f"\ncount:{len(rows)} unhealthy:{unhealthy} unassigned:{unassigned}" + truncation_note())
+         toon("edgehosts", fields, rows),
+         f"\ncount:{len(rows)} unhealthy:{unhealthy} unassigned:{unassigned}{filtered_note}" + truncation_note())
+
+
+def _match_edgehosts(ref, items):
+    """Same match order as resolve_by_name (uid exact, name exact, substring)
+    but returns the list of hits instead of dying -- an --all-projects search
+    needs to keep looking in the next project on a miss, not exit on the first
+    one it tries."""
+    if UID_RE.match(ref):
+        hit = next((i for i in items if dget(i, "metadata").get("uid") == ref), None)
+        return [hit] if hit else []
+    exact = [i for i in items if (dget(i, "metadata").get("name") or "").lower() == ref.lower()]
+    if exact:
+        return exact
+    return [i for i in items if ref.lower() in (dget(i, "metadata").get("name") or "").lower()]
+
+
+# Evidence for the shape below: read from a real GET /v1/edgehosts/{uid}
+# response (customer data, never copied into this repo) and reproduced here
+# as synthetic fixtures with the same field names/types. spec.device is the
+# hardware inventory the `edgehosts` list has never surfaced: archType,
+# cpu.cores, memory.sizeInMB, secureBoot, hostType, os{family,version,
+# kernelVersion}, disks[]{controller,size,vendor,partitions[]}, nics[]{...},
+# gpus[]. spec.host{hostAddress,...} is a sibling of spec.device, not nested
+# under it. Fields may be JSON null rather than omitted -- dget() throughout,
+# never a bare .get(k, {}).
+def cmd_edgehost(a):
+    key = get_api_key(a.tenant)
+    # --all-projects forces the multi-project search even if --project or
+    # $PALETTE_PROJECT is set; with neither given, the same search is also the
+    # default -- an SE with just a UID from a ticket usually doesn't know the
+    # project either. This mirrors resolve_project's existing contract for
+    # every other verb (never guess) without changing resolve_project itself.
+    use_all = a.all_projects or not (a.project or os.environ.get("PALETTE_PROJECT"))
+
+    search_note = ""
+    if use_all:
+        projects = list_all(PROJECTS_PATH, key)
+        found = []
+        for p in projects:
+            puid = dget(p, "metadata").get("uid")
+            pname = dget(p, "metadata").get("name")
+            if not puid:
+                continue
+            items = list_all(EDGEHOSTS_PATH, key, puid, method="POST", json_body={"filter": {}, "sort": []})
+            matches = _match_edgehosts(a.ref, items)
+            if matches:
+                found.append((puid, pname, matches))
+        if not found:
+            die(f"no edge host matching '{a.ref}' in any of {len(projects)} projects "
+                "searched -- pass --project to search just one", E_NOTFOUND)
+        if len(found) > 1:
+            where = ", ".join(f"{pname} ({len(m)})" for _, pname, m in found)
+            die(f"'{a.ref}' matches edge hosts in more than one project: {where} "
+                "-- pass --project to disambiguate", E_USAGE)
+        proj, proj_name, matches = found[0]
+        if len(matches) > 1:
+            names = ", ".join(sorted((dget(m, "metadata").get("name") or "") for m in matches))
+            die(f"ambiguous edge host '{a.ref}' in project {proj_name}: {names}", E_USAGE)
+        hit = matches[0]
+        search_note = f"note: found via --all-projects search ({len(projects)} projects searched); matched project {proj_name}"
+    else:
+        proj = resolve_project(a.project, key)
+        items = list_all(EDGEHOSTS_PATH, key, proj, method="POST", json_body={"filter": {}, "sort": []})
+        hit = resolve_by_name(a.ref, items, "edge host")
+
+    uid = dget(hit, "metadata").get("uid")
+    eh = api("GET", f"/v1/edgehosts/{uid}", key, proj)
+
+    if a.json:
+        print(json.dumps(eh, indent=2))
+        return
+
+    m, sp, st = dget(eh, "metadata"), dget(eh, "spec"), dget(eh, "status")
+    dev = dget(sp, "device")
+    os_ = dget(dev, "os")
+    host = dget(sp, "host")
+    health = dget(st, "health")
+    in_use = st.get("inUseClusters") or []
+    cluster = ", ".join(c.get("name", "") for c in in_use)
+    labels = dget(m, "labels")
+    labels_str = ",".join(f"{k}={v}" for k, v in sorted(labels.items())) or None
+
+    cores = dget(dev, "cpu").get("cores")
+    mem_mb = dget(dev, "memory").get("sizeInMB")
+    mem_gb = round(mem_mb / 1024, 1) if isinstance(mem_mb, (int, float)) else None
+    os_str = " ".join(x for x in [os_.get("family"), os_.get("version")] if x) or None
+
+    row = {"name": m.get("name"), "uid": uid, "project": proj,
+           "state": st.get("state"), "health": health.get("state"),
+           "agentVersion": health.get("agentVersion"), "cluster": cluster,
+           "archType": dev.get("archType"), "hostType": dev.get("hostType"),
+           "secureBoot": dev.get("secureBoot"), "os": os_str,
+           "kernel": os_.get("kernelVersion"), "cores": cores, "memGB": mem_gb,
+           "hostAddress": host.get("hostAddress"), "labels": labels_str}
+
+    emit(f"tenant={a.tenant} project={proj}",
+         toon("edgehost", ["name", "uid", "project", "state", "health", "agentVersion",
+                            "cluster", "archType", "hostType", "secureBoot", "os", "kernel",
+                            "cores", "memGB", "hostAddress", "labels"], [row]),
+         search_note)
+
+    disks = dev.get("disks") or []
+    drows = []
+    for i, d in enumerate(disks):
+        parts = d.get("partitions") or []
+        mounts = ", ".join(p.get("mountPoint") for p in parts if p.get("mountPoint"))
+        drows.append({"idx": i, "vendor": d.get("vendor"), "controller": d.get("controller"),
+                      "sizeGB": d.get("size"), "partitions": len(parts), "mounts": trunc(mounts, 70)})
+    emit(toon("disks", ["idx", "vendor", "controller", "sizeGB", "partitions", "mounts"], drows))
+
+    nics = dev.get("nics") or []
+    visible = [n for n in nics if a.all_nics or not _is_virtual_nic(n.get("nicName"))]
+    hidden = len(nics) - len(visible)
+    nrows = [{"name": n.get("nicName"), "mac": n.get("macAddr"), "ip": n.get("ip"),
+              "subnet": n.get("subnet"), "gateway": n.get("gateway"),
+              "default": bool(n.get("isDefault"))} for n in visible]
+    emit(toon("nics", ["name", "mac", "ip", "subnet", "gateway", "default"], nrows),
+         f"\nnicCount:{len(visible)}" + (f"  [+{hidden} virtual hidden, --all-nics]" if hidden > 0 else ""))
+
+    gpus = dev.get("gpus") or []
+    emit(f"gpuCount:{len(gpus)}",
+         nxt(f"palette-axi edgehosts --project {proj} --wide"))
 
 
 # Evidence probed 9/15/26 against custeng-prod, live cluster rpi-inference
@@ -1173,7 +1363,28 @@ def main():
 
     s = sub.add_parser("edgehosts", help="list edge hosts (state, health, cluster) in a project")
     s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT)")
+    s.add_argument("--wide", action="store_true",
+                   help="add hardware columns (cores, memGB, disks, sanDisks, ip, secureBoot) -- "
+                        "fetches each host individually if the list response doesn't already "
+                        "carry spec.device; sanDisks is a vendor-name heuristic "
+                        "(PURE/NETAPP/EMC/HITACHI/IBM), not a protocol check")
+    s.add_argument("--min-cores", type=int,
+                   help="only show hosts with at least this many CPU cores (client-side filter; "
+                        "implies the same per-host hardware fetch as --wide)")
+    s.add_argument("--label", help="only show hosts with this metadata label, k=v (client-side filter)")
     s.set_defaults(fn=cmd_edgehosts)
+
+    s = sub.add_parser("edgehost", help="describe one edge host: hardware inventory (cpu, memory, disks, nics, gpus)")
+    s.add_argument("ref", help="edge host name or uid")
+    s.add_argument("--project", help="project name or uid (or set PALETTE_PROJECT); "
+                                     "omit to search every project (this is the default with neither set)")
+    s.add_argument("--all-projects", action="store_true",
+                   help="search every project even if --project/$PALETTE_PROJECT is set")
+    s.add_argument("--all-nics", action="store_true",
+                   help="show virtual/container NICs too (lxc*, cilium*, veth*, flannel*, cni*, "
+                        "docker*, kube-ipvs*, vxlan*, genev*, tunl*, lo are hidden by default)")
+    s.add_argument("--json", action="store_true", help="dump the raw GET /v1/edgehosts/{uid} response")
+    s.set_defaults(fn=cmd_edgehost)
 
     s = sub.add_parser("cloudaccounts",
                         help="list cloud accounts (aws, azure, vsphere, maas, ...) visible at tenant or project scope")
