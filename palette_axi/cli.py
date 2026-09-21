@@ -416,6 +416,11 @@ def api(method, path, api_key, project=None, params=None, json_body=None, timeou
         die(f"{method} {path} -> HTTP {e.code}: {msg}", code)
     except urllib.error.URLError as e:
         die(f"network error calling {path}: {e.reason}")
+    except TimeoutError:
+        # A read timeout mid-body is a bare TimeoutError, not a URLError.
+        # Seen live 9/21/26 on GET /v1/dashboard/projects (loves tenant): it
+        # escaped as a raw traceback instead of an error line and exit code.
+        die(f"timeout after {timeout}s reading {method} {path} — Palette was slow; retry")
 
 
 def list_all(path, api_key, project=None, filters=None, page_limit=50, max_pages=10,

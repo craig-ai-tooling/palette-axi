@@ -1132,6 +1132,33 @@ class TestKeyCache(unittest.TestCase):
         self.assertFalse(os.path.exists(self._key_path()), "a 401 must delete the cached key file it was serving")
 
 
+class TestApiReadTimeout(unittest.TestCase):
+    """A read timeout mid-body raises a bare TimeoutError, not URLError. Seen
+    live 9/21/26 on the loves tenant: it escaped as a raw traceback."""
+
+    def test_read_timeout_dies_cleanly_with_err_exit(self):
+        class SlowResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise TimeoutError("The read operation timed out")
+
+        real_urlopen = palette_axi.urllib.request.urlopen
+        palette_axi.urllib.request.urlopen = lambda *a, **k: SlowResp()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                palette_axi.api("GET", "/v1/dashboard/projects", "k")
+        finally:
+            palette_axi.urllib.request.urlopen = real_urlopen
+        self.assertEqual(ctx.exception.code, palette_axi.E_ERR)
+        self.assertIn("timeout after 30s reading GET /v1/dashboard/projects", err.getvalue())
+
+
 class TestKeyCacheDoctorRow(unittest.TestCase):
     """`doctor`'s config table gets one row for key-cache state -- never a
     new connector, never the key value itself."""
