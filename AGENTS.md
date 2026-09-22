@@ -31,6 +31,7 @@ same packaging standard.
 | Path | What lives here |
 |---|---|
 | `palette_axi/` | Application code (`cli.py` has everything; `__init__.py` holds `__version__`) |
+| `palette_axi/axi.py` | Exit codes and TOON output helpers, vendored from `craig-ai-tooling/axi-py` (`make vendor-axi`) — never edited here |
 | `tests/` | Offline unit tests — no network, no 1Password |
 | `.github/workflows/` | CI (`ci.yml`) + release (`release.yml`, fires on a `v*` tag) |
 | `scripts/install.sh` | Installs the released `.pyz` by curling the public release asset |
@@ -60,8 +61,9 @@ works. CI runs exactly these commands.
 **Errors** — never swallow. `die(msg, code)` prints `error: <msg>` to stderr and exits
 with one of the exit codes below. Per-row/list failures are reported, never dropped.
 
-**Output** — TOON (`toon()`/`emit()`/`nxt()` in `cli.py`), matching `opp-axi`'s contract
-exactly. `None` and `False` are different facts and must render differently.
+**Output** — TOON (`toon()`/`emit()`/`nxt()`), vendored from `craig-ai-tooling/axi-py`
+into `palette_axi/axi.py`; never edited here. `None` and `False` are different facts
+and must render differently.
 
 **Tests** — offline; the network layer (`api()`, `get_api_key()`, `_op_*`) is
 monkeypatched or stubbed. A test that only checks the source text for the right endpoint

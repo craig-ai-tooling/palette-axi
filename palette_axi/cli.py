@@ -64,63 +64,12 @@ UID_RE = re.compile(r"^[0-9a-f]{24}$")
 KEY_CACHE_TTL_DEFAULT = 900  # seconds; override with $PALETTE_AXI_KEY_TTL (0 disables)
 ITEM_CACHE_TTL = 24 * 60 * 60  # tenant -> op item id is not a secret and rarely changes
 
-# Exit codes — mirrors opp-axi's contract so both tools compose in the same
-# pipeline/agent loop without the caller needing two different tables.
-#   0 E_OK        success
-#   1 E_ERR       API/network/op error, or any failure not covered below
-#   2 E_USAGE     bad args, or an ambiguous name that needs disambiguating
-#   3 E_NOTFOUND  no such project/cluster/profile/edge host/pack
-#   4 E_REFUSED   refused on policy grounds (reserved — v1 has no write path
-#                 to refuse, kept for symmetry and for any future verb that
-#                 needs to say no)
-E_OK, E_ERR, E_USAGE, E_NOTFOUND, E_REFUSED = 0, 1, 2, 3, 4
-
-
-# ── output (copied verbatim from opp-axi — both tools must agree) ──────────
-def _tv(v):
-    """TOON scalar: quote only when it would break the row.
-
-    None and False are DIFFERENT facts and must not share a cell. Collapsing
-    False into "" made "POV not required" read identically to "nobody knows",
-    which is exactly the kind of silent wrong answer this tool exists to stop.
-    Empty means unknown; false means known-false."""
-    if v is None:
-        return ""
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    s = str(v).replace("\r", "")
-    if any(c in s for c in ',"\n'):
-        return '"' + s.replace('"', '""').replace("\n", "\\n") + '"'
-    return s
-
-
-def toon(name, fields, rows, indent="  "):
-    """TOON block. rows==[] yields a definitive `name[0]{...}: (none)` — never ambiguous."""
-    head = f"{name}[{len(rows)}]{{{','.join(fields)}}}:"
-    if not rows:
-        return head + " (none)"
-    return "\n".join([head] + [indent + ",".join(_tv(r.get(f)) for f in fields) for r in rows])
-
-
-def emit(*parts):
-    print("\n".join(p for p in parts if p))
-
-
-def nxt(*suggestions):
-    """Contextual disclosure — what to run next, not a wall of help text."""
-    return "\nnext: " + " | ".join(suggestions) if suggestions else ""
-
-
-def die(msg, code=E_ERR):
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def size_hint(full, shown):
-    extra = len(full) - len(shown)
-    return f"  [+{extra}B truncated, --full]" if extra > 0 else ""
+# Exit codes and TOON output helpers (_tv/toon/emit/nxt/die) live in
+# palette_axi/axi.py, vendored from craig-ai-tooling/axi-py. Never redefine
+# them here — see that file's header for how to change them.
+from .axi import E_ERR, E_NOTFOUND, E_OK, E_USAGE, die, emit, nxt, toon
+from .axi import E_REFUSED  # noqa: F401 -- reserved exit code, part of README's documented contract; no verb raises it yet
+from .axi import _tv  # noqa: F401 -- re-exported so tests can exercise TOON scalar quoting directly via cli._tv
 
 
 def trunc(s, n=90):
