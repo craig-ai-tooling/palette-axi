@@ -6,11 +6,10 @@ TOON output, minimal default schemas, truncation with --full escape hatches,
 pre-computed aggregates, definitive empty states, structured exit codes,
 content-first output, and next-step disclosure.
 
-READ-ONLY. No verb in this tool creates, updates, deletes, or deploys
-anything against Palette. See README.md "Future work" for the write case
-that was deliberately left out. `doctor` is the one exception to "no verb
-prints anything but data" in spirit only — it still never mutates Palette;
-it just probes whether the 1Password and Palette API connectors are usable.
+Reads AND writes since 0.6.0. Every write verb takes --dry-run (print the exact
+requests, send nothing), needs an explicit --project (never $PALETTE_PROJECT),
+and refuses to change or delete anything outside that project; deletes also
+need --yes. See README.md "Write verbs" for the full safety model.
 
 Auth: PALETTE_API_KEY env var wins if set. Otherwise the key is pulled from
 1Password (vault "Lobster", or $PALETTE_AXI_VAULT) by resolving the item
@@ -51,6 +50,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import __version__
+
 API_BASE = "https://api.spectrocloud.com"
 DEFAULT_TENANT = os.environ.get("PALETTE_AXI_TENANT", "custeng-prod")
 OP_VAULT = os.environ.get("PALETTE_AXI_VAULT", "Lobster")
@@ -68,7 +69,7 @@ ITEM_CACHE_TTL = 24 * 60 * 60  # tenant -> op item id is not a secret and rarely
 # palette_axi/axi.py, vendored from craig-ai-tooling/axi-py. Never redefine
 # them here — see that file's header for how to change them.
 from .axi import E_ERR, E_NOTFOUND, E_OK, E_USAGE, die, emit, nxt, toon
-from .axi import E_REFUSED  # noqa: F401 -- reserved exit code, part of README's documented contract; no verb raises it yet
+from .axi import E_REFUSED
 from .axi import _tv  # noqa: F401 -- re-exported so tests can exercise TOON scalar quoting directly via cli._tv
 
 
@@ -330,46 +331,79 @@ def get_api_key(tenant):
 
 
 # ── Palette API ──────────────────────────────────────────────────────────
-def api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+# 11/18/26: a burst of probes got `429 TooManyRequests` from api.spectrocloud.com
+# mid-run. A 429 means the request was NOT processed, so retrying is safe even
+# for a POST/PUT/DELETE. Bounded: RETRY_429 retries, Retry-After honoured but
+# capped, so a throttled agent waits seconds, not forever.
+RETRY_429 = 3
+RETRY_429_MAX_WAIT = 15
+
+
+def _retry_after(header, attempt):
+    try:
+        return min(float(header), RETRY_429_MAX_WAIT)
+    except (TypeError, ValueError):
+        return min(2 ** (attempt + 1), RETRY_429_MAX_WAIT)
+
+
+def _http(method, path, api_key, project=None, params=None, json_body=None, timeout=30,
+          accept="application/json"):
     url = f"{API_BASE}{path}"
     if params:
         clean = {k: v for k, v in params.items() if v is not None}
         if clean:
             url += "?" + urllib.parse.urlencode(clean)
-    headers = {"ApiKey": api_key, "Accept": "application/json"}
+    headers = {"ApiKey": api_key, "Accept": accept}
     if project:
         headers["ProjectUid"] = project
     data = None
     if json_body is not None:
         data = json.dumps(json_body).encode()
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read()
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        body = e.read()
+    for attempt in range(RETRY_429 + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            j = json.loads(body)
-            msg = j.get("message") or j.get("error") or str(j)[:300]
-        except Exception:
-            msg = body.decode(errors="replace")[:300] or e.reason
-        if e.code == 401 and _LAST_KEY_CACHE_PATH:
-            # A cached key the API now rejects is worse than no cache at all —
-            # every call would die the same way until someone clears it by
-            # hand. Delete it so the next run re-reads 1Password.
-            with contextlib.suppress(OSError):
-                os.unlink(_LAST_KEY_CACHE_PATH)
-        code = E_NOTFOUND if e.code == 404 else E_ERR
-        die(f"{method} {path} -> HTTP {e.code}: {msg}", code)
-    except urllib.error.URLError as e:
-        die(f"network error calling {path}: {e.reason}")
-    except TimeoutError:
-        # A read timeout mid-body is a bare TimeoutError, not a URLError.
-        # Seen live 9/21/26 on GET /v1/dashboard/projects (loves tenant): it
-        # escaped as a raw traceback instead of an error line and exit code.
-        die(f"timeout after {timeout}s reading {method} {path} — Palette was slow; retry")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            if e.code == 429 and attempt < RETRY_429:
+                time.sleep(_retry_after(e.headers.get("Retry-After") if e.headers else None, attempt))
+                continue
+            try:
+                j = json.loads(body)
+                msg = j.get("message") or j.get("error") or str(j)[:300]
+            except Exception:
+                msg = body.decode(errors="replace")[:300] or e.reason
+            if e.code == 401 and _LAST_KEY_CACHE_PATH:
+                # A cached key the API now rejects is worse than no cache at all —
+                # every call would die the same way until someone clears it by
+                # hand. Delete it so the next run re-reads 1Password.
+                with contextlib.suppress(OSError):
+                    os.unlink(_LAST_KEY_CACHE_PATH)
+            code = E_NOTFOUND if e.code == 404 else E_ERR
+            die(f"{method} {path} -> HTTP {e.code}: {msg}", code)
+        except urllib.error.URLError as e:
+            die(f"network error calling {path}: {e.reason}")
+        except TimeoutError:
+            # A read timeout mid-body is a bare TimeoutError, not a URLError.
+            # Seen live 9/21/26 on GET /v1/dashboard/projects (loves tenant): it
+            # escaped as a raw traceback instead of an error line and exit code.
+            die(f"timeout after {timeout}s reading {method} {path} — Palette was slow; retry")
+
+
+def api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
+    body = _http(method, path, api_key, project, params, json_body, timeout)
+    return json.loads(body) if body else {}
+
+
+def api_raw(method, path, api_key, project=None, params=None, timeout=60):
+    """For the octet-stream endpoints (kubeconfig, profile export). Confirmed
+    live 11/18/26: sent with `Accept: application/json` they answer 200 with the
+    14-byte body `{"Reader":{}}` -- a serialized Go io.Reader, not the file. A
+    caller that trusts the 200 writes that into a kubeconfig. Ask for
+    octet-stream and the real content comes back."""
+    return _http(method, path, api_key, project, params, None, timeout, accept="application/octet-stream")
 
 
 # The page loops below stop on their own: a short page, no continue token, or a
@@ -627,10 +661,75 @@ def cmd_cluster(a):
          else nxt(f"palette-axi events {m.get('name')} --project {proj}"))
 
 
+# 11/18/26, confirmed live (custeng-prod, SA-Craig-Smith): `GET /v1/clusterprofiles`
+# now answers `405: method GET is not allowed, but [POST] are` -- the same move
+# /v1/projects and /v1/edgehosts made. `POST /v1/dashboard/clusterprofiles` with
+# a filter body serves the rows, pages via listmeta.continue, but returns ONE row
+# per profile NAME: metadata.uid is the newest version and
+# specSummary.versions[] = [{uid, version}] carries every version. The old list
+# returned one row per version, so expand versions back out, newest first --
+# `profiles` keeps listing every version and `profile <name>` keeps resolving.
+PROFILES_PATH = "/v1/dashboard/clusterprofiles"
+
+
+def _vkey(v):
+    parts = re.split(r"[.\-]", v or "0")
+    return tuple(int(x) if x.isdigit() else 0 for x in parts)
+
+
+def list_profiles(key, proj):
+    rows = list_all(PROFILES_PATH, key, proj, method="POST", json_body={"filter": {}, "sort": []})
+    out = []
+    for p in rows:
+        m, ss = dget(p, "metadata"), dget(p, "specSummary")
+        pub = dget(ss, "published")
+        versions = [v for v in (ss.get("versions") or []) if (v or {}).get("uid")]
+        if not versions:
+            versions = [{"uid": m.get("uid"), "version": ss.get("version")}]
+        versions.sort(key=lambda v: _vkey(v.get("version")), reverse=True)
+        for v in versions:
+            out.append({"metadata": {"name": m.get("name"), "uid": v["uid"],
+                                     "annotations": dget(m, "annotations")},
+                        "spec": {"version": v.get("version"), "cloudType": pub.get("cloudType"),
+                                 "published": {"type": pub.get("type")}}})
+    return out
+
+
+def resolve_profile(ref, key, proj, version=None, strict=False):
+    """uid -> that uid (no list call). name -> exact (case-insensitive) or unique
+    substring NAME, then its versions. A name carries one row per version, so
+    `strict` (every write verb) refuses to pick one when there are several and
+    no --version was given; the read verb takes the newest, matching what the
+    old per-version list resolved to in practice. Returns (uid, name, version)."""
+    if UID_RE.match(ref):
+        return ref, None, None
+    items = list_profiles(key, proj)
+    names = {}
+    for i in items:
+        names.setdefault(i["metadata"]["name"], []).append(i)
+    exact = [n for n in names if (n or "").lower() == ref.lower()]
+    cands = exact or [n for n in names if ref.lower() in (n or "").lower()]
+    if not cands:
+        die(f"no profile matching '{ref}' in project {proj}", E_NOTFOUND)
+    if len(cands) > 1:
+        die(f"ambiguous profile '{ref}': {', '.join(sorted(cands))}", E_USAGE)
+    rows = names[cands[0]]
+    if version:
+        rows = [r for r in rows if r["spec"]["version"] == version]
+        if not rows:
+            have = ", ".join(r["spec"]["version"] or "" for r in names[cands[0]])
+            die(f"profile '{cands[0]}' has no version {version} (have: {have})", E_NOTFOUND)
+    if strict and len(rows) > 1:
+        have = ", ".join(f"{r['spec']['version']}={r['metadata']['uid']}" for r in rows)
+        die(f"profile '{cands[0]}' has {len(rows)} versions ({have}) -- pass --version or a uid", E_USAGE)
+    r = rows[0]
+    return r["metadata"]["uid"], r["metadata"]["name"], r["spec"]["version"]
+
+
 def cmd_profiles(a):
     key = get_api_key(a.tenant)
     proj = resolve_project(a.project, key)
-    items = list_all("/v1/clusterprofiles", key, proj)
+    items = list_profiles(key, proj)
     rows = []
     for p in items:
         m, sp = dget(p, "metadata"), dget(p, "spec")
@@ -646,9 +745,7 @@ def cmd_profiles(a):
 def cmd_profile(a):
     key = get_api_key(a.tenant)
     proj = resolve_project(a.project, key)
-    items = list_all("/v1/clusterprofiles", key, proj)
-    hit = resolve_by_name(a.ref, items, "profile")
-    uid = hit["metadata"]["uid"]
+    uid, _, _ = resolve_profile(a.ref, key, proj)
     p = api("GET", f"/v1/clusterprofiles/{uid}", key, proj)
     m, sp = dget(p, "metadata"), dget(p, "spec")
     pub = dget(sp, "published")
@@ -1175,11 +1272,7 @@ def cmd_packs(a):
     items = list_all("/v1/packs", key, proj, filters=f"metadata.name={a.name}", page_limit=50, max_pages=10)
     active = [p for p in items if not dget(p, "status").get("disabled")]
 
-    def vkey(p):
-        parts = re.split(r"[.\-]", dget(p, "spec").get("version") or "0")
-        return tuple(int(x) if x.isdigit() else 0 for x in parts)
-
-    active.sort(key=vkey, reverse=True)
+    active.sort(key=lambda p: _vkey(dget(p, "spec").get("version")), reverse=True)
     rows = active if a.full else active[:12]
     trows = []
     for i, p in enumerate(rows):
@@ -1265,6 +1358,713 @@ def cmd_pack_values(a):
          nxt(f"palette-axi pack-values {a.name} {a.version} --project {proj} --values",
              f"palette-axi pack-values {a.name} {a.version} --project {proj} --preset <name>")
          if prows else "")
+
+
+# ── write support ──────────────────────────────────────────────────────
+# Safety model for every verb that changes Palette (README "Write verbs"):
+#   * --project is REQUIRED on the command line. $PALETTE_PROJECT is not honored
+#     for writes: an env var left over from another task must never pick the
+#     project a create or delete lands in. Edge host tokens are the one
+#     tenant-scoped write (the API rejects a ProjectUid header there).
+#   * --dry-run runs the reads needed to build the request, then prints the exact
+#     method, path, ProjectUid and body of every write it WOULD send, and sends none.
+#   * Deletes need --yes, and refuse (E_REFUSED) any resource whose
+#     metadata.annotations.projectUid is not the --project given, or whose scope is
+#     not "project". Tenant-scoped objects are visible from a project; they are
+#     never deleted from one.
+#   * A profile change is a NEW version by default (`profile version`), never an
+#     in-place edit of a version a cluster is running.
+#   * Secrets in a printed body (apiKey, password, token, ...) render as ********.
+SECRET_KEY_RE = re.compile(r"(apikey|api_key|password|secret|token|credential|privatekey|private_key)", re.I)
+
+
+def redact(obj):
+    if isinstance(obj, dict):
+        return {k: ("********" if SECRET_KEY_RE.search(k) and isinstance(v, str) and v else redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(x) for x in obj]
+    return obj
+
+
+def write_project(a, key):
+    """Resolve --project for a write verb. Explicit flag only, see above."""
+    if not getattr(a, "project", None):
+        die("write verbs need an explicit --project <name|uid> ($PALETTE_PROJECT is not honored for writes)",
+            E_USAGE)
+    return resolve_project(a.project, key)
+
+
+def load_json(path, what="body"):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except OSError as e:
+        die(f"cannot read {what} file {path}: {e.strerror}", E_USAGE)
+    except json.JSONDecodeError as e:
+        die(f"{what} file {path} is not valid JSON: {e}", E_USAGE)
+
+
+def read_text(path, what="file"):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as e:
+        die(f"cannot read {what} {path}: {e.strerror}", E_USAGE)
+
+
+def parse_kv(pairs, flag="--var"):
+    out = {}
+    for p in pairs or []:
+        if "=" not in p:
+            die(f"{flag} must be name=value, got '{p}'", E_USAGE)
+        k, v = p.split("=", 1)
+        out[k] = v
+    return out
+
+
+def emit_plan(steps, proj):
+    """steps: [(method, path, params, body)] -- printed, never sent."""
+    rows = []
+    for method, path, params, _ in steps:
+        q = ("?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})) if params else ""
+        rows.append({"method": method, "path": path + q, "project": proj})
+    emit("dry-run: no write request was sent", toon("request", ["method", "path", "project"], rows))
+    for i, (method, path, _, body) in enumerate(steps):
+        if body is not None:
+            print(f"body[{i}] {method} {path}:")
+            print(json.dumps(redact(body), indent=2))
+
+
+def emit_changed(rows, *hints):
+    emit(toon("changed", ["action", "kind", "name", "uid", "project"], rows), nxt(*hints) if hints else "")
+
+
+def assert_in_project(obj, proj, kind, label):
+    """The delete/edit guard: the object must belong to this project."""
+    ann = dget(dget(obj, "metadata"), "annotations")
+    scope, owner = ann.get("scope"), ann.get("projectUid")
+    if scope != "project" or owner != proj:
+        die(f"refusing: {kind} '{label}' has scope={scope or '?'} projectUid={owner or '?'}, "
+            f"not project {proj}. palette-axi never changes or deletes objects outside --project.", E_REFUSED)
+
+
+def write_file_600(path, data):
+    path = os.path.expanduser(path)
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(tmp, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data if isinstance(data, bytes) else data.encode())
+    os.replace(tmp, path)
+    return os.path.abspath(path)
+
+
+def _resolve_cluster(ref, key, proj):
+    if UID_RE.match(ref):
+        c = api("GET", f"/v1/spectroclusters/{ref}", key, proj)
+        return ref, dget(c, "metadata").get("name"), c
+    hit = resolve_by_name(ref, list_clusters(key, proj), "cluster")
+    uid = hit["metadata"]["uid"]
+    return uid, hit["metadata"]["name"], api("GET", f"/v1/spectroclusters/{uid}", key, proj)
+
+
+# ── profile writes ─────────────────────────────────────────────────────
+def _profile_vars_from_body(body):
+    sp = dget(body, "spec")
+    return sp.get("variables") or dget(sp, "template").get("variables") or []
+
+
+def cmd_profile_create(a):
+    """POST /v1/clusterprofiles (draft), PUT .../variables when the body declares
+    any, PATCH .../publish with --publish. Transcript evidence (sbux-kaas build,
+    11/17/26): a POST body's spec.variables was dropped silently on one profile
+    and kept on another, and the working scripts all followed the create with a
+    PUT of the variables. PUT replaces the list with the same content, so sending
+    it always is idempotent and removes the guesswork."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    body = load_json(a.file)
+    name = dget(body, "metadata").get("name")
+    if not name:
+        die(f"{a.file}: metadata.name is required", E_USAGE)
+    if not dget(body, "spec").get("version"):
+        die(f"{a.file}: spec.version is required (e.g. 1.0.0)", E_USAGE)
+    variables = _profile_vars_from_body(body)
+    steps = [("POST", "/v1/clusterprofiles", None, body)]
+    if variables:
+        steps.append(("PUT", "/v1/clusterprofiles/<new-uid>/variables", None, {"variables": variables}))
+    if a.publish:
+        steps.append(("PATCH", "/v1/clusterprofiles/<new-uid>/publish", None, None))
+    if a.dry_run:
+        return emit_plan(steps, proj)
+    uid = api("POST", "/v1/clusterprofiles", key, proj, json_body=body).get("uid")
+    if not uid:
+        die("POST /v1/clusterprofiles returned no uid", E_ERR)
+    if variables:
+        api("PUT", f"/v1/clusterprofiles/{uid}/variables", key, proj, json_body={"variables": variables})
+    if a.publish:
+        api("PATCH", f"/v1/clusterprofiles/{uid}/publish", key, proj)
+    emit_changed([{"action": "created" + ("+published" if a.publish else " (draft)"), "kind": "clusterprofile",
+                   "name": f"{name} {dget(body, 'spec').get('version')}", "uid": uid, "project": proj}],
+                 f"palette-axi profile {uid} --project {proj} --variables")
+
+
+def cmd_profile_version(a):
+    """New version of an existing profile, never an edit in place (Craig's rule,
+    9/16/26: keep every old version for traceability). POST
+    /v1/clusterprofiles/{src}/clone {metadata:{name, version}} copies packs,
+    values, manifests and variables server-side -- no export/import round trip,
+    so masked sensitive values never break it. --set-pack-values then PUTs
+    /v1/clusterprofiles/{new}/packs/{name} {pack:{name, uid, tag, type, layer,
+    values}} on the NEW uid only.
+
+    Confirmed live 11/18/26 (paxi-selftest): clone returns an already-PUBLISHED
+    copy, and the pack PUT lands in its DRAFT -- the published values do not
+    change until PATCH .../publish. So with --set-pack-values the new version is
+    published by default (it is brand new, no cluster uses it); --no-publish
+    leaves the edit in the draft."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    src_uid, _, _ = resolve_profile(a.ref, key, proj, version=a.from_version, strict=True)
+    src = api("GET", f"/v1/clusterprofiles/{src_uid}", key, proj)
+    assert_in_project(src, proj, "profile", src_uid)
+    name = dget(src, "metadata").get("name")
+    sp = dget(src, "spec")
+    existing = {(v or {}).get("version") for v in sp.get("versions") or []} | {sp.get("version")}
+    if a.version in existing:
+        die(f"profile '{name}' already has version {a.version} -- pick a new one", E_USAGE)
+    packs = {p.get("name"): p for p in dget(sp, "published").get("packs") or []}
+    steps = [("POST", f"/v1/clusterprofiles/{src_uid}/clone", None,
+              {"metadata": {"name": name, "version": a.version}})]
+    for pk_name, path in parse_kv(a.set_pack_values, "--set-pack-values").items():
+        pk = packs.get(pk_name)
+        if not pk:
+            die(f"profile '{name}' has no pack '{pk_name}' (packs: {', '.join(sorted(packs))})", E_NOTFOUND)
+        steps.append(("PUT", f"/v1/clusterprofiles/<new-uid>/packs/{pk_name}", None,
+                      {"pack": {"name": pk_name, "uid": pk.get("packUid"), "tag": pk.get("tag"),
+                                "type": pk.get("type"), "layer": pk.get("layer"),
+                                "values": read_text(path, "values file")}}))
+    publish = len(steps) > 1 and not a.no_publish
+    if publish:
+        steps.append(("PATCH", "/v1/clusterprofiles/<new-uid>/publish", None, None))
+    if a.dry_run:
+        return emit_plan(steps, proj)
+    out = api("POST", f"/v1/clusterprofiles/{src_uid}/clone", key, proj, json_body=steps[0][3])
+    uid = out.get("uid")
+    if not uid:
+        die(f"clone returned no uid: {str(out)[:200]}", E_ERR)
+    for method, path, _, body in steps[1:]:
+        api(method, path.replace("<new-uid>", uid), key, proj, json_body=body)
+    emit_changed([{"action": "created version" + (" +published" if publish else (" (pack edits in draft)" if len(steps) > 1 else "")), "kind": "clusterprofile",
+                   "name": f"{name} {a.version} (from {sp.get('version')})", "uid": uid, "project": proj}],
+                 f"palette-axi profile {uid} --project {proj}",
+                 f"palette-axi cluster profiles swap <cluster> --from {src_uid} --to {uid} --project {proj}")
+
+
+def cmd_profile_variables_set(a):
+    """PUT /v1/clusterprofiles/{uid}/variables. --file replaces the whole list;
+    --set name=default edits defaults of variables that already exist. Palette
+    refuses variable edits on a version a cluster runs (VariableUpdateFailure),
+    so this refuses up front and points at `profile version`."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, _, _ = resolve_profile(a.ref, key, proj, version=a.version, strict=True)
+    prof = api("GET", f"/v1/clusterprofiles/{uid}", key, proj)
+    assert_in_project(prof, proj, "profile", uid)
+    in_use = dget(prof, "status").get("inUseClusterUids") or []
+    if in_use and not a.force:
+        die(f"profile {uid} is used by {len(in_use)} cluster(s); Palette rejects variable edits on an in-use "
+            "version. Create a new one: palette-axi profile version ... (or --force to try anyway)", E_REFUSED)
+    if a.file:
+        data = load_json(a.file, "variables")
+        variables = data.get("variables") if isinstance(data, dict) else data
+        if not isinstance(variables, list):
+            die(f"{a.file}: expected {{\"variables\": [...]}} or a list", E_USAGE)
+    else:
+        sets = parse_kv(a.set, "--set")
+        if not sets:
+            die("give --file vars.json or one or more --set name=default", E_USAGE)
+        variables = api("GET", f"/v1/clusterprofiles/{uid}/variables", key, proj).get("variables") or []
+        known = {v.get("name") for v in variables}
+        missing = sorted(set(sets) - known)
+        if missing:
+            die(f"no such variable(s) on profile {uid}: {', '.join(missing)} (known: {', '.join(sorted(known))})"
+                " -- use --file to add new ones", E_NOTFOUND)
+        for v in variables:
+            if v.get("name") in sets:
+                v["defaultValue"] = sets[v["name"]]
+    body = {"variables": variables}
+    if a.dry_run:
+        return emit_plan([("PUT", f"/v1/clusterprofiles/{uid}/variables", None, body)], proj)
+    api("PUT", f"/v1/clusterprofiles/{uid}/variables", key, proj, json_body=body)
+    emit_changed([{"action": f"set {len(variables)} variables", "kind": "clusterprofile",
+                   "name": dget(prof, "metadata").get("name"), "uid": uid, "project": proj}],
+                 f"palette-axi profile {uid} --project {proj} --variables")
+
+
+def cmd_profile_publish(a):
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, _, _ = resolve_profile(a.ref, key, proj, version=a.version, strict=True)
+    prof = api("GET", f"/v1/clusterprofiles/{uid}", key, proj)
+    assert_in_project(prof, proj, "profile", uid)
+    if a.dry_run:
+        return emit_plan([("PATCH", f"/v1/clusterprofiles/{uid}/publish", None, None)], proj)
+    api("PATCH", f"/v1/clusterprofiles/{uid}/publish", key, proj)
+    emit_changed([{"action": "published", "kind": "clusterprofile", "name": dget(prof, "metadata").get("name"),
+                   "uid": uid, "project": proj}])
+
+
+def cmd_profile_delete(a):
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, _, _ = resolve_profile(a.ref, key, proj, version=a.version, strict=True)
+    prof = api("GET", f"/v1/clusterprofiles/{uid}", key, proj)
+    label = f"{dget(prof, 'metadata').get('name')} {dget(prof, 'spec').get('version')}"
+    assert_in_project(prof, proj, "profile", label)
+    in_use = dget(prof, "status").get("inUseClusterUids") or []
+    if in_use:
+        die(f"refusing: profile {label} ({uid}) is attached to cluster(s) {', '.join(in_use)}", E_REFUSED)
+    if a.dry_run:
+        return emit_plan([("DELETE", f"/v1/clusterprofiles/{uid}", None, None)], proj)
+    if not a.yes:
+        die(f"would delete profile {label} ({uid}) in project {proj}; re-run with --yes", E_REFUSED)
+    api("DELETE", f"/v1/clusterprofiles/{uid}", key, proj)
+    emit_changed([{"action": "deleted", "kind": "clusterprofile", "name": label, "uid": uid, "project": proj}])
+
+
+def cmd_profile_export(a):
+    """GET /v1/clusterprofiles/{uid}/export: name+tag based JSON with manifests
+    inline and variables -- the input `profile create --file` and the native
+    /import both take. Needs Accept: octet-stream (see api_raw)."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    uid, _, _ = resolve_profile(a.ref, key, proj, version=a.version)
+    data = api_raw("GET", f"/v1/clusterprofiles/{uid}/export", key, proj)
+    try:
+        doc = json.loads(data)
+    except json.JSONDecodeError:
+        die(f"export of {uid} was not JSON ({len(data)} bytes)", E_ERR)
+    if set(doc) == {"Reader"}:
+        die("export returned the empty {\"Reader\":{}} placeholder -- Accept header problem", E_ERR)
+    text = json.dumps(doc, indent=2)
+    if a.out:
+        path = write_file_600(a.out, text + "\n")
+        emit(toon("export", ["name", "version", "uid", "path", "bytes"],
+                  [{"name": dget(doc, "metadata").get("name"), "version": dget(doc, "spec").get("version"),
+                    "uid": uid, "path": path, "bytes": len(text)}]))
+    else:
+        print(text)
+
+
+# ── cluster reads/writes ───────────────────────────────────────────────
+KUBECONFIG_KINDS = {"default": "kubeconfig", "admin": "adminKubeconfig", "client": "kubeconfigclient"}
+
+
+def cmd_cluster_kubeconfig(a):
+    """GET /v1/spectroclusters/{uid}/assets/{kubeconfig|adminKubeconfig|kubeconfigclient}.
+    Written to a mode-600 file, never stdout unless --stdout: it is a credential.
+    The default (`kubeconfig`) is the OIDC/non-admin one when the cluster has
+    OIDC configured; --admin is the admin cert kubeconfig."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    uid, name, _ = _resolve_cluster(a.ref, key, proj)
+    kind = "admin" if a.admin else ("client" if a.client else "default")
+    data = api_raw("GET", f"/v1/spectroclusters/{uid}/assets/{KUBECONFIG_KINDS[kind]}", key, proj)
+    if b"apiVersion" not in data or b"clusters" not in data:
+        die(f"{KUBECONFIG_KINDS[kind]} for {name} is not a kubeconfig ({len(data)} bytes) -- cluster may not "
+            "be Running yet", E_ERR)
+    if a.stdout:
+        sys.stdout.write(data.decode(errors="replace"))
+        return
+    path = write_file_600(a.out or f"./{name}.kubeconfig", data)
+    emit(toon("kubeconfig", ["cluster", "uid", "kind", "path", "mode"],
+              [{"cluster": name, "uid": uid, "kind": kind, "path": path, "mode": "600"}]),
+         nxt(f"KUBECONFIG={path} kubectl get nodes"))
+
+
+def _cluster_vars(key, proj, uid):
+    """GET /v1/spectroclusters/{uid}/variables -> [{profileUid, variables:[{name,
+    value, isSensitive, ...}]}] (confirmed live 11/18/26)."""
+    data = api("GET", f"/v1/spectroclusters/{uid}/variables", key, proj)
+    return data if isinstance(data, list) else (data.get("items") or [])
+
+
+def cmd_cluster_variables(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    uid, name, _ = _resolve_cluster(a.ref, key, proj)
+    rows = []
+    for e in _cluster_vars(key, proj, uid):
+        for v in e.get("variables") or []:
+            sens = bool(v.get("isSensitive"))
+            rows.append({"profileUid": e.get("profileUid"), "name": v.get("name"),
+                         "value": "********" if sens else v.get("value"),
+                         "default": "********" if sens else v.get("defaultValue"), "sensitive": sens})
+    emit(f"tenant={a.tenant} project={proj} cluster={name}",
+         toon("variables", ["profileUid", "name", "value", "default", "sensitive"], rows),
+         f"\ncount:{len(rows)}")
+
+
+def cmd_cluster_rbac(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    uid, name, _ = _resolve_cluster(a.ref, key, proj)
+    items = api("GET", f"/v1/spectroclusters/{uid}/config/rbacs", key, proj).get("items") or []
+    rows = []
+    for r in items:
+        for b in dget(r, "spec").get("bindings") or []:
+            subs = ", ".join(f"{s.get('type')}:{s.get('name')}" for s in b.get("subjects") or [])
+            rows.append({"type": b.get("type"), "namespace": b.get("namespace"),
+                         "role": dget(b, "role").get("name"), "subjects": subs})
+    emit(f"tenant={a.tenant} project={proj} cluster={name}",
+         toon("bindings", ["type", "namespace", "role", "subjects"], rows), f"\ncount:{len(rows)}")
+
+
+def cmd_cluster_rbac_set(a):
+    """PUT /v1/spectroclusters/{uid}/config/rbacs with the --file body verbatim
+    ({"rbacs":[{"spec":{"bindings":[...]}}]}). It REPLACES the cluster's RBAC set."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, name, c = _resolve_cluster(a.ref, key, proj)
+    assert_in_project(c, proj, "cluster", name)
+    body = load_json(a.file)
+    if not isinstance(body, dict) or not isinstance(body.get("rbacs"), list):
+        die(f"{a.file}: expected {{\"rbacs\": [...]}}", E_USAGE)
+    if a.dry_run:
+        return emit_plan([("PUT", f"/v1/spectroclusters/{uid}/config/rbacs", None, body)], proj)
+    api("PUT", f"/v1/spectroclusters/{uid}/config/rbacs", key, proj, json_body=body)
+    emit_changed([{"action": "rbac replaced", "kind": "cluster", "name": name, "uid": uid, "project": proj}],
+                 f"palette-axi cluster rbac {name} --project {proj}")
+
+
+CLUSTER_CREATE_KINDS = ("edge-native", "maas", "virtual")
+
+
+def check_cluster_body(kind, body):
+    """Refuse bodies with a known silent failure. 11/2026: POST
+    /v1/spectroclusters/edge-native returns 201 with cloudConfig.vip and drops
+    it -- the cluster never gets a control-plane endpoint and cannot be repaired
+    while Provisioning. The field it honours is
+    cloudConfig.controlPlaneEndpoint {host, type: VIP}."""
+    if not dget(body, "metadata").get("name"):
+        die("body: metadata.name is required", E_USAGE)
+    cc = dget(dget(body, "spec"), "cloudConfig")
+    if kind == "edge-native" and cc.get("vip") and not dget(cc, "controlPlaneEndpoint").get("host"):
+        die("refusing: spec.cloudConfig.vip is silently dropped by POST /v1/spectroclusters/edge-native. "
+            'Use "controlPlaneEndpoint": {"host": "<ip>", "type": "VIP"} instead.', E_REFUSED)
+    if kind == "virtual":
+        hcc = dget(dget(dget(body, "spec"), "clusterConfig"), "hostClusterConfig")
+        if not dget(hcc, "clusterGroup").get("uid"):
+            die("body: spec.clusterConfig.hostClusterConfig.clusterGroup.uid is required for a virtual cluster",
+                E_USAGE)
+
+
+def cmd_cluster_create(a):
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    body = load_json(a.file)
+    check_cluster_body(a.kind, body)
+    name = body["metadata"]["name"]
+    path = f"/v1/spectroclusters/{a.kind}"
+    if a.dry_run:
+        return emit_plan([("POST", path, None, body)], proj)
+    uid = api("POST", path, key, proj, json_body=body).get("uid")
+    emit_changed([{"action": "created", "kind": f"cluster/{a.kind}", "name": name, "uid": uid, "project": proj}],
+                 f"palette-axi cluster {uid} --project {proj}", f"palette-axi events {uid} --project {proj}")
+
+
+def _profile_entry(uid, variables):
+    e = {"uid": uid}
+    if variables:
+        e["variables"] = [{"name": k, "value": v} for k, v in variables.items()]
+    return e
+
+
+def cmd_cluster_profiles_attach(a):
+    """PATCH /v1/spectroclusters/{uid}/profiles?resolveNotification=false --
+    additive: attaches without detaching anything (spectrocloud-clusters skill)."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, name, c = _resolve_cluster(a.ref, key, proj)
+    assert_in_project(c, proj, "cluster", name)
+    puid, _, _ = resolve_profile(a.profile, key, proj, version=a.version, strict=True)
+    attached = {t.get("uid") for t in dget(c, "spec").get("clusterProfileTemplates") or []}
+    if puid in attached:
+        die(f"profile {puid} is already attached to {name}", E_USAGE)
+    body = {"profiles": [_profile_entry(puid, parse_kv(a.var))]}
+    params = {"resolveNotification": "false"}
+    if a.dry_run:
+        return emit_plan([("PATCH", f"/v1/spectroclusters/{uid}/profiles", params, body)], proj)
+    api("PATCH", f"/v1/spectroclusters/{uid}/profiles", key, proj, params, json_body=body)
+    emit_changed([{"action": f"attached profile {puid}", "kind": "cluster", "name": name, "uid": uid,
+                   "project": proj}], f"palette-axi cluster {name} --project {proj} --profiles")
+
+
+def cmd_cluster_profiles_swap(a):
+    """Point a cluster at a different profile version. PUT
+    /v1/spectroclusters/{uid}/profiles REPLACES the attached set, so the body
+    carries every currently attached uid, with --from swapped for --to.
+
+    A new profile version is a new uid, and the cluster's variable overrides were
+    keyed to the old one: a bare swap resets them to the new version's defaults
+    (tds-cluster incident: MetalLB range/interface reset to placeholders). So the
+    current values are read from GET .../variables and re-supplied for the new
+    uid, plus --var overrides. Sensitive values come back as ******** and cannot
+    be carried; the swap refuses unless each is given with --var or
+    --allow-sensitive-reset is passed."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, name, c = _resolve_cluster(a.ref, key, proj)
+    assert_in_project(c, proj, "cluster", name)
+    templates = dget(c, "spec").get("clusterProfileTemplates") or []
+    attached = [t.get("uid") for t in templates]
+    from_uid, _, _ = resolve_profile(a.from_profile, key, proj, strict=True) if not UID_RE.match(a.from_profile) \
+        else (a.from_profile, None, None)
+    if from_uid not in attached:
+        die(f"profile {from_uid} is not attached to {name} (attached: {', '.join(attached)})", E_NOTFOUND)
+    to_uid, _, _ = resolve_profile(a.to_profile, key, proj, version=a.to_version, strict=True)
+    if to_uid == from_uid:
+        die("--from and --to are the same profile uid", E_USAGE)
+    overrides = parse_kv(a.var)
+    current = next((e for e in _cluster_vars(key, proj, uid) if e.get("profileUid") == from_uid), {})
+    carried, masked = {}, []
+    for v in current.get("variables") or []:
+        n = v.get("name")
+        if n in overrides:
+            continue
+        if v.get("isSensitive"):
+            masked.append(n)
+        elif v.get("value") not in (None, ""):
+            carried[n] = v.get("value")
+    if masked and not a.allow_sensitive_reset:
+        die(f"refusing: sensitive variable(s) {', '.join(masked)} come back masked and would reset to the new "
+            "version's defaults. Re-supply each with --var name=value, or pass --allow-sensitive-reset.", E_REFUSED)
+    new_vars = {**carried, **overrides}
+    profiles = []
+    for t in attached:
+        profiles.append(_profile_entry(to_uid, new_vars) if t == from_uid else {"uid": t})
+    body = {"profiles": profiles}
+    if a.dry_run:
+        emit(f"carried:{len(carried)} overridden:{len(overrides)} sensitiveReset:{len(masked)}")
+        return emit_plan([("PUT", f"/v1/spectroclusters/{uid}/profiles", None, body)], proj)
+    api("PUT", f"/v1/spectroclusters/{uid}/profiles", key, proj, json_body=body)
+    emit_changed([{"action": f"swapped {from_uid} -> {to_uid} ({len(new_vars)} vars re-supplied)", "kind": "cluster",
+                   "name": name, "uid": uid, "project": proj}],
+                 f"palette-axi cluster variables {name} --project {proj}",
+                 f"palette-axi cluster {name} --project {proj} --profiles")
+
+
+def cmd_cluster_delete(a):
+    """DELETE /v1/spectroclusters/{uid}; --force adds ?forceDelete=true, which
+    Palette only accepts once the cluster is already Deleting (and, per the
+    sbux-kaas build 11/17/26, not until 15 min after an aborted delete). So
+    --force refuses unless status.state is Deleting."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    uid, name, c = _resolve_cluster(a.ref, key, proj)
+    assert_in_project(c, proj, "cluster", name)
+    state = dget(c, "status").get("state")
+    params = None
+    if a.force:
+        if state != "Deleting":
+            die(f"refusing --force: cluster {name} is '{state}', not Deleting. Run a plain delete first; "
+                "Palette only accepts forceDelete on a Deleting cluster.", E_REFUSED)
+        params = {"forceDelete": "true"}
+    if a.dry_run:
+        return emit_plan([("DELETE", f"/v1/spectroclusters/{uid}", params, None)], proj)
+    if not a.yes:
+        die(f"would delete cluster {name} ({uid}, state {state}) in project {proj}; re-run with --yes", E_REFUSED)
+    api("DELETE", f"/v1/spectroclusters/{uid}", key, proj, params)
+    emit_changed([{"action": "force-deleted" if a.force else "delete requested", "kind": "cluster", "name": name,
+                   "uid": uid, "project": proj}], f"palette-axi cluster {uid} --project {proj}")
+
+
+# ── PCGs, cloud accounts, cluster groups, virtual clusters, tokens ────
+def cmd_pcgs(a):
+    """GET /v1/overlords (confirmed live 11/18/26): kind, annotations.overlordVersion,
+    status.state, status.health.{state,lastHeartBeatTimestamp}, spec.ipAddress."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    items = api("GET", "/v1/overlords", key, proj).get("items") or []
+    rows = []
+    for o in items:
+        m, st, sp = dget(o, "metadata"), dget(o, "status"), dget(o, "spec")
+        h = dget(st, "health")
+        rows.append({"name": m.get("name"), "uid": m.get("uid"), "kind": o.get("kind"),
+                     "scope": dget(m, "annotations").get("scope"),
+                     "version": dget(m, "annotations").get("overlordVersion"), "state": st.get("state"),
+                     "health": h.get("state"), "lastHeartbeat": ts(h.get("lastHeartBeatTimestamp")),
+                     "ip": sp.get("ipAddress")})
+    rows.sort(key=lambda r: (r["kind"] or "", r["name"] or ""))
+    unhealthy = sum(1 for r in rows if is_unhealthy(r["health"]))
+    emit(f"tenant={a.tenant}" + (f" project={proj}" if proj else ""),
+         toon("pcgs", ["name", "uid", "kind", "scope", "version", "state", "health", "lastHeartbeat", "ip"], rows),
+         f"\ncount:{len(rows)} unhealthy:{unhealthy}", nxt("palette-axi pcg <name>"))
+
+
+def cmd_pcg(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    if UID_RE.match(a.ref):
+        uid = a.ref
+    else:
+        uid = resolve_by_name(a.ref, api("GET", "/v1/overlords", key, proj).get("items") or [], "pcg")["metadata"]["uid"]
+    o = api("GET", f"/v1/overlords/{uid}", key, proj)
+    m, st, sp = dget(o, "metadata"), dget(o, "status"), dget(o, "spec")
+    h = dget(st, "health")
+    emit(toon("pcg", ["name", "uid", "kind", "version", "state", "health", "agentVersion", "lastHeartbeat",
+                      "ip", "cloudAccountUid", "clusterUid", "isReady"],
+              [{"name": m.get("name"), "uid": uid, "kind": o.get("kind"),
+                "version": dget(m, "annotations").get("overlordVersion"), "state": st.get("state"),
+                "health": h.get("state"), "agentVersion": h.get("agentVersion"),
+                "lastHeartbeat": ts(h.get("lastHeartBeatTimestamp")), "ip": sp.get("ipAddress"),
+                "cloudAccountUid": sp.get("cloudAccountUid"), "clusterUid": sp.get("spectroClusterUid"),
+                "isReady": st.get("isReady")}]))
+    conds = h.get("conditions") or []
+    show = conds if a.full else [x for x in conds if (x or {}).get("status") not in ("True", True)]
+    emit(toon("conditions", ["type", "status", "reason", "message"],
+              [{"type": x.get("type"), "status": x.get("status"), "reason": x.get("reason"),
+                "message": trunc(x.get("message"), 100)} for x in show if x]))
+
+
+def cmd_cloudaccount(a):
+    """Describe one account: GET /v1/cloudaccounts/{kind}/{uid}. That endpoint
+    returns live credentials (maas spec.apiKey, aws secretKey, ...) -- every
+    secret-shaped key is masked before anything prints, --json included."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key) if a.project or os.environ.get("PALETTE_PROJECT") else None
+    items = list_all("/v1/cloudaccounts/summary", key, proj)
+    if a.cloud:
+        items = [i for i in items if (i.get("kind") or "").lower() == a.cloud.lower()]
+    hit = resolve_by_name(a.ref, items, "cloud account")
+    kind, uid = hit.get("kind"), hit["metadata"]["uid"]
+    acct = redact(api("GET", f"/v1/cloudaccounts/{kind}/{uid}", key, proj))
+    if a.json:
+        print(json.dumps(acct, indent=2))
+        return
+    m, sp = dget(acct, "metadata"), dget(acct, "spec")
+    ann = dget(m, "annotations")
+    emit(toon("cloudaccount", ["name", "uid", "kind", "scope", "projectUid", "pcg", "endpoint", "created"],
+              [{"name": m.get("name"), "uid": uid, "kind": kind, "scope": ann.get("scope"),
+                "projectUid": ann.get("projectUid"), "pcg": ann.get("overlordUid") or None,
+                "endpoint": sp.get("apiEndpoint") or sp.get("vcenterServer") or sp.get("identityEndpoint"),
+                "created": ts(m.get("creationTimestamp"))}]),
+         f"specKeys: {', '.join(sorted(sp))}  (secrets masked; --json for the redacted document)")
+
+
+def cmd_cloudaccount_create(a):
+    """POST /v1/cloudaccounts/maas?privateGateway=<pcg uid> with ProjectUid,
+    body {metadata:{name}, spec:{apiEndpoint, apiKey}} (sbux-kaas build
+    11/17/26: accepted before the PCG was Running). The MAAS API key comes from
+    --api-key-env VAR or --api-key-file, never argv (it would land in shell
+    history and `ps`), and prints masked."""
+    key = get_api_key(a.tenant)
+    proj = write_project(a, key)
+    if a.cloud != "maas":
+        die("only maas is supported", E_USAGE)
+    if a.file:
+        body = load_json(a.file)
+    else:
+        if not (a.name and a.endpoint):
+            die("give --file body.json, or --name, --endpoint and --api-key-env/--api-key-file", E_USAGE)
+        if a.api_key_env:
+            secret = os.environ.get(a.api_key_env)
+            if not secret:
+                die(f"${a.api_key_env} is unset or empty", E_USAGE)
+        elif a.api_key_file:
+            secret = read_text(a.api_key_file, "api key file").strip()
+        else:
+            die("the MAAS API key must come from --api-key-env VAR or --api-key-file PATH", E_USAGE)
+        body = {"metadata": {"name": a.name}, "spec": {"apiEndpoint": a.endpoint, "apiKey": secret}}
+    params = None
+    if a.pcg:
+        pcg_uid = a.pcg if UID_RE.match(a.pcg) else resolve_by_name(
+            a.pcg, api("GET", "/v1/overlords", key, proj).get("items") or [], "pcg")["metadata"]["uid"]
+        params = {"privateGateway": pcg_uid}
+    if a.dry_run:
+        return emit_plan([("POST", "/v1/cloudaccounts/maas", params, body)], proj)
+    uid = api("POST", "/v1/cloudaccounts/maas", key, proj, params, json_body=body).get("uid")
+    emit_changed([{"action": "created", "kind": "cloudaccount/maas", "name": dget(body, "metadata").get("name"),
+                   "uid": uid, "project": proj}], f"palette-axi cloudaccount {uid} --project {proj}")
+
+
+def cmd_clustergroups(a):
+    """GET /v1/clustergroups/hostCluster/metadata (GET /v1/clustergroups is
+    POST-only = create; /v1/dashboard/clustergroups 404s -- probed 11/18/26).
+    UNVERIFIED with a populated project: SA-Craig-Smith had no groups left."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = api("GET", "/v1/clustergroups/hostCluster/metadata", key, proj).get("items") or []
+    rows = [{"name": dget(i, "metadata").get("name"), "uid": dget(i, "metadata").get("uid"),
+             "scope": dget(dget(i, "metadata"), "annotations").get("scope")} for i in items]
+    emit(f"tenant={a.tenant} project={proj}", toon("clustergroups", ["name", "uid", "scope"], rows),
+         f"\ncount:{len(rows)}", nxt("palette-axi clustergroup <uid>") if rows else "")
+
+
+def cmd_clustergroup(a):
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    uid = a.ref
+    if not UID_RE.match(uid):
+        items = api("GET", "/v1/clustergroups/hostCluster/metadata", key, proj).get("items") or []
+        uid = resolve_by_name(a.ref, items, "cluster group")["metadata"]["uid"]
+    g = api("GET", f"/v1/clustergroups/{uid}", key, proj)
+    m, sp = dget(g, "metadata"), dget(g, "spec")
+    cc = dget(sp, "clustersConfig")
+    lim = dget(cc, "limitConfig")
+    emit(toon("clustergroup", ["name", "uid", "scope", "hosts", "endpointType", "distro", "cpuMilliCore",
+                               "memoryMiB", "storageGiB", "overSubscription"],
+              [{"name": m.get("name"), "uid": uid, "scope": dget(m, "annotations").get("scope"),
+                "hosts": len(sp.get("clusterRefs") or []), "endpointType": cc.get("endpointType"),
+                "distro": cc.get("kubernetesDistroType"), "cpuMilliCore": lim.get("cpuMilliCore"),
+                "memoryMiB": lim.get("memoryMiB"), "storageGiB": lim.get("storageGiB"),
+                "overSubscription": lim.get("overSubscription")}]),
+         toon("hosts", ["clusterUid", "name"], [{"clusterUid": r.get("clusterUid"), "name": r.get("clusterName")}
+                                                for r in sp.get("clusterRefs") or []]))
+
+
+def cmd_vclusters(a):
+    """Virtual clusters are spectroclusters; list_clusters() already returns them.
+    Filtered on cloudType nested/virtual. UNVERIFIED live: no virtual cluster
+    existed in SA-Craig-Smith on 11/18/26 to confirm which string Palette uses."""
+    key = get_api_key(a.tenant)
+    proj = resolve_project(a.project, key)
+    items = [c for c in list_clusters(key, proj) if (_cloud_type(c) or "") in ("nested", "virtual")]
+    rows = [{"name": dget(c, "metadata").get("name"), "uid": dget(c, "metadata").get("uid"),
+             "state": dget(c, "status").get("state"), "health": dget(dget(c, "status"), "health").get("state")}
+            for c in items]
+    emit(f"tenant={a.tenant} project={proj}", toon("vclusters", ["name", "uid", "state", "health"], rows),
+         f"\ncount:{len(rows)}" + truncation_note())
+
+
+def cmd_edgehost_token_create(a):
+    """POST /v1/edgehosts/tokens -- TENANT-scoped: the API rejects a ProjectUid
+    header with ProjectUidIsNotEmpty (spectrocloud-clusters skill). The token is
+    at spec.token; it is a registration credential, so it goes to a mode-600
+    file unless --stdout."""
+    key = get_api_key(a.tenant)
+    body = {"metadata": {"name": a.name}}
+    if a.expiry:
+        body["spec"] = {"expiry": a.expiry}
+    if a.dry_run:
+        return emit_plan([("POST", "/v1/edgehosts/tokens", None, body)], "(tenant scope, no ProjectUid)")
+    out = api("POST", "/v1/edgehosts/tokens", key, None, json_body=body)
+    uid = out.get("uid")
+    tok = dget(out, "spec").get("token")
+    if not tok and uid:
+        tok = dget(api("GET", f"/v1/edgehosts/tokens/{uid}", key, None), "spec").get("token")
+    if not tok:
+        die(f"token {uid} created but no spec.token came back", E_ERR)
+    if a.stdout:
+        print(tok)
+        return
+    path = write_file_600(a.out or f"./{a.name}.token", tok + "\n")
+    emit_changed([{"action": "created", "kind": "edgehost-token", "name": a.name, "uid": uid,
+                   "project": "(tenant)"}], f"token written to {path} (mode 600)")
 
 
 # ── doctor ─────────────────────────────────────────────────────────────
@@ -1406,12 +2206,46 @@ def cmd_doctor(a):
     sys.exit(E_ERR if required_bad else E_OK)
 
 
+# `palette-axi profile create ...` reads better than `profile-create`, but
+# `profile <ref>` and `cluster <ref>` already take a positional. Rather than
+# nest subparsers (which would change those verbs), rewrite the two-word forms
+# to the hyphenated verbs before argparse sees them. Consequence: a profile or
+# cluster literally named one of these action words must be addressed by uid.
+VERB_REWRITES = {
+    ("profile", "variables", "set"): "profile-variables-set",
+    ("profile", "create"): "profile-create", ("profile", "version"): "profile-version",
+    ("profile", "publish"): "profile-publish", ("profile", "delete"): "profile-delete",
+    ("profile", "export"): "profile-export",
+    ("cluster", "profiles", "attach"): "cluster-profiles-attach",
+    ("cluster", "profiles", "swap"): "cluster-profiles-swap",
+    ("cluster", "rbac", "set"): "cluster-rbac-set", ("cluster", "rbac"): "cluster-rbac",
+    ("cluster", "create"): "cluster-create", ("cluster", "delete"): "cluster-delete",
+    ("cluster", "kubeconfig"): "cluster-kubeconfig", ("cluster", "variables"): "cluster-variables",
+    ("cluster", "events"): "events",
+    ("cloudaccount", "create"): "cloudaccount-create",
+    ("edgehost", "token", "create"): "edgehost-token-create",
+}
+
+
+def rewrite_argv(argv):
+    argv = list(argv)
+    i = 0
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] == "--tenant" else 1
+    for n in (3, 2):
+        key = tuple(argv[i:i + n])
+        if key in VERB_REWRITES:
+            return argv[:i] + [VERB_REWRITES[key]] + argv[i + n:]
+    return argv
+
+
 # ── cli ────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(prog="palette-axi", description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tenant", default=DEFAULT_TENANT,
                     help=f"1Password 'Palette API Key (<tenant>)' item to use (default: {DEFAULT_TENANT})")
+    p.add_argument("--version", action="version", version=f"palette-axi {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("projects", help="list projects in the tenant")
@@ -1518,11 +2352,206 @@ def main():
     s.add_argument("--preset", help="print only this preset's add YAML plus a '# remove:' comment block")
     s.set_defaults(fn=cmd_pack_values)
 
+    # ── verbs added in 0.6.0 (reads first, then writes) ──
+    def proj_arg(s, write=False):
+        s.add_argument("--project", help="project name or uid" + (
+            " -- REQUIRED for writes; $PALETTE_PROJECT is not honored" if write else " (or set PALETTE_PROJECT)"))
+
+    def write_args(s, delete=False):
+        s.add_argument("--dry-run", action="store_true",
+                       help="do the reads, print the exact method/path/ProjectUid/body of each write, send nothing")
+        if delete:
+            s.add_argument("--yes", action="store_true", help="required to actually delete")
+
+    s = sub.add_parser("cluster-kubeconfig", help="download a cluster kubeconfig to a mode-600 file "
+                                                 "(also: cluster kubeconfig <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s)
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--admin", action="store_true", help="admin kubeconfig (assets/adminKubeconfig)")
+    g.add_argument("--client", action="store_true", help="client kubeconfig (assets/kubeconfigclient)")
+    s.add_argument("--out", help="file to write (default ./<cluster>.kubeconfig), mode 600")
+    s.add_argument("--stdout", action="store_true", help="print to stdout instead of a file (it is a credential)")
+    s.set_defaults(fn=cmd_cluster_kubeconfig)
+
+    s = sub.add_parser("cluster-variables", help="a cluster's current profile-variable values "
+                                                "(also: cluster variables <ref>); sensitive values masked")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_cluster_variables)
+
+    s = sub.add_parser("cluster-rbac", help="a cluster's RBAC bindings (also: cluster rbac <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_cluster_rbac)
+
+    s = sub.add_parser("cluster-rbac-set", help="WRITE: replace a cluster's RBAC bindings from a JSON file "
+                                               "(also: cluster rbac set <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s, write=True)
+    s.add_argument("--file", required=True, help='JSON body {"rbacs":[{"spec":{"bindings":[...]}}]}')
+    write_args(s)
+    s.set_defaults(fn=cmd_cluster_rbac_set)
+
+    s = sub.add_parser("cluster-create", help="WRITE: create a cluster from a JSON body "
+                                             "(also: cluster create <kind> --file ...)")
+    s.add_argument("kind", choices=CLUSTER_CREATE_KINDS)
+    proj_arg(s, write=True)
+    s.add_argument("--file", required=True, help="JSON request body (metadata.name required)")
+    write_args(s)
+    s.set_defaults(fn=cmd_cluster_create)
+
+    s = sub.add_parser("cluster-profiles-attach", help="WRITE: attach one more profile, additive PATCH "
+                                                      "(also: cluster profiles attach <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s, write=True)
+    s.add_argument("--profile", required=True, help="profile name or uid to attach")
+    s.add_argument("--version", help="profile version, when the name has several")
+    s.add_argument("--var", action="append", help="variable override name=value (repeatable)")
+    write_args(s)
+    s.set_defaults(fn=cmd_cluster_profiles_attach)
+
+    s = sub.add_parser("cluster-profiles-swap", help="WRITE: swap an attached profile for another version, "
+                                                    "re-supplying variables (also: cluster profiles swap <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s, write=True)
+    s.add_argument("--from", dest="from_profile", required=True, help="attached profile uid (or unique name)")
+    s.add_argument("--to", dest="to_profile", required=True, help="new profile uid or name")
+    s.add_argument("--to-version", help="version of --to, when the name has several")
+    s.add_argument("--var", action="append", help="variable value name=value for the new profile (repeatable)")
+    s.add_argument("--allow-sensitive-reset", action="store_true",
+                   help="proceed even though masked sensitive variables will reset to defaults")
+    write_args(s)
+    s.set_defaults(fn=cmd_cluster_profiles_swap)
+
+    s = sub.add_parser("cluster-delete", help="WRITE: delete a cluster in --project (also: cluster delete <ref>)")
+    s.add_argument("ref", help="cluster name or uid")
+    proj_arg(s, write=True)
+    s.add_argument("--force", action="store_true", help="forceDelete=true; only accepted once the cluster is Deleting")
+    write_args(s, delete=True)
+    s.set_defaults(fn=cmd_cluster_delete)
+
+    s = sub.add_parser("profile-create", help="WRITE: create a cluster profile from a JSON body "
+                                             "(also: profile create --file ...)")
+    proj_arg(s, write=True)
+    s.add_argument("--file", required=True, help="JSON body: metadata.name, spec.version, spec.template, "
+                                                 "optional spec.variables")
+    s.add_argument("--publish", action="store_true", help="publish after create (default: leave a draft)")
+    write_args(s)
+    s.set_defaults(fn=cmd_profile_create)
+
+    s = sub.add_parser("profile-version", help="WRITE: new version of a profile via server-side clone; never "
+                                              "edits the source (also: profile version <ref> --version X)")
+    s.add_argument("ref", nargs="?", help="source profile name or uid (or --from)")
+    s.add_argument("--from", dest="from_ref", help="source profile uid or name")
+    s.add_argument("--from-version", help="source version, when the name has several")
+    s.add_argument("--version", required=True, help="the new version string, e.g. 1.2.1")
+    s.add_argument("--set-pack-values", action="append",
+                   help="pack=values.yaml -- replace that pack's values in the NEW version (repeatable; "
+                        "use the full values file, partial values fail validation)")
+    s.add_argument("--no-publish", action="store_true",
+                   help="leave --set-pack-values edits in the draft (default: publish them; a clone itself "
+                        "comes back published)")
+    proj_arg(s, write=True)
+    write_args(s)
+    s.set_defaults(fn=cmd_profile_version)
+
+    s = sub.add_parser("profile-variables-set", help="WRITE: change a profile's declared variables "
+                                                    "(also: profile variables set <ref>)")
+    s.add_argument("ref", help="profile name or uid")
+    s.add_argument("--version", help="profile version, when the name has several")
+    proj_arg(s, write=True)
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--file", help='{"variables":[...]} -- replaces the whole list')
+    g.add_argument("--set", action="append", help="name=default for an existing variable (repeatable)")
+    s.add_argument("--force", action="store_true", help="try even when a cluster uses this version")
+    write_args(s)
+    s.set_defaults(fn=cmd_profile_variables_set)
+
+    s = sub.add_parser("profile-publish", help="WRITE: publish a draft profile (also: profile publish <ref>)")
+    s.add_argument("ref", help="profile name or uid")
+    s.add_argument("--version", help="profile version, when the name has several")
+    proj_arg(s, write=True)
+    write_args(s)
+    s.set_defaults(fn=cmd_profile_publish)
+
+    s = sub.add_parser("profile-delete", help="WRITE: delete one profile version that no cluster uses "
+                                             "(also: profile delete <ref>)")
+    s.add_argument("ref", help="profile name or uid")
+    s.add_argument("--version", help="profile version, when the name has several")
+    proj_arg(s, write=True)
+    write_args(s, delete=True)
+    s.set_defaults(fn=cmd_profile_delete)
+
+    s = sub.add_parser("profile-export", help="export a profile as JSON, manifests inline "
+                                             "(also: profile export <ref>)")
+    s.add_argument("ref", help="profile name or uid")
+    s.add_argument("--version", help="profile version, when the name has several")
+    proj_arg(s)
+    s.add_argument("--out", help="write to this file instead of stdout")
+    s.set_defaults(fn=cmd_profile_export)
+
+    s = sub.add_parser("pcgs", help="list private cloud gateways (overlords): state, health, version, heartbeat")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_pcgs)
+
+    s = sub.add_parser("pcg", help="describe one PCG, with non-True health conditions")
+    s.add_argument("ref", help="PCG name or uid")
+    proj_arg(s)
+    s.add_argument("--full", action="store_true", help="all conditions")
+    s.set_defaults(fn=cmd_pcg)
+
+    s = sub.add_parser("cloudaccount", help="describe one cloud account (credentials masked)")
+    s.add_argument("ref", help="account name or uid")
+    proj_arg(s)
+    s.add_argument("--cloud", help="restrict lookup to one kind (maas, aws, ...)")
+    s.add_argument("--json", action="store_true", help="the full document, secrets masked")
+    s.set_defaults(fn=cmd_cloudaccount)
+
+    s = sub.add_parser("cloudaccount-create", help="WRITE: create a MAAS cloud account "
+                                                  "(also: cloudaccount create maas ...)")
+    s.add_argument("cloud", choices=["maas"])
+    proj_arg(s, write=True)
+    s.add_argument("--file", help="full JSON body instead of the flags below")
+    s.add_argument("--name")
+    s.add_argument("--endpoint", help="MAAS API endpoint, e.g. http://10.0.0.2:5240/MAAS")
+    s.add_argument("--api-key-env", help="env var holding the MAAS API key (never pass it on argv)")
+    s.add_argument("--api-key-file", help="file holding the MAAS API key")
+    s.add_argument("--pcg", help="PCG name or uid (privateGateway)")
+    write_args(s)
+    s.set_defaults(fn=cmd_cloudaccount_create)
+
+    s = sub.add_parser("clustergroups", help="list cluster groups in a project")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_clustergroups)
+
+    s = sub.add_parser("clustergroup", help="describe one cluster group: host clusters, limits")
+    s.add_argument("ref", help="cluster group name or uid")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_clustergroup)
+
+    s = sub.add_parser("vclusters", help="list virtual clusters in a project")
+    proj_arg(s)
+    s.set_defaults(fn=cmd_vclusters)
+
+    s = sub.add_parser("edgehost-token-create", help="WRITE: create a tenant-scoped edge host registration "
+                                                    "token, written to a mode-600 file")
+    s.add_argument("name")
+    s.add_argument("--expiry", help="ISO-8601 expiry (optional)")
+    s.add_argument("--out", help="token file (default ./<name>.token)")
+    s.add_argument("--stdout", action="store_true", help="print the token instead of writing a file")
+    write_args(s)
+    s.set_defaults(fn=cmd_edgehost_token_create)
+
     s = sub.add_parser("doctor", help="check whether 1Password and the Palette API are usable")
     s.add_argument("--json", action="store_true", help="emit JSON instead of TOON")
     s.set_defaults(fn=cmd_doctor)
 
-    a = p.parse_args()
+    a = p.parse_args(rewrite_argv(sys.argv[1:]))
+    if getattr(a, "fn", None) is cmd_profile_version:
+        a.ref = a.from_ref or a.ref
+        if not a.ref:
+            p.error("profile version needs a source: <ref> or --from <uid>")
     if not a.cmd:
         p.print_help()
         sys.exit(E_USAGE)

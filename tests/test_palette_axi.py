@@ -1431,7 +1431,12 @@ class TestProfileVariables(unittest.TestCase):
         def fake_api(method, path, api_key, project=None, params=None, json_body=None, timeout=30):
             self.calls.append({"method": method, "path": path, "project": project})
             if path == "/v1/clusterprofiles":
-                return {"items": [{"metadata": {"name": "vmo-infra-profile", "uid": self.PROFILE_UID}}],
+                raise AssertionError("GET /v1/clusterprofiles answers 405 since 11/18/26")
+            if path == "/v1/dashboard/clusterprofiles":
+                self.assertEqual(method, "POST")
+                return {"items": [{"metadata": {"name": "vmo-infra-profile", "uid": self.PROFILE_UID},
+                                   "specSummary": {"version": "1.0.0", "versions": [
+                                       {"uid": self.PROFILE_UID, "version": "1.0.0"}]}}],
                         "listmeta": {"count": 1}}
             if path == f"/v1/clusterprofiles/{self.PROFILE_UID}":
                 return dict(profile)
