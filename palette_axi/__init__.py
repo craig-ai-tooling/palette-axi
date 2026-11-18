@@ -1,3 +1,3 @@
 """palette-axi — agent-ergonomic CLI over the Spectro Cloud Palette API."""
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"

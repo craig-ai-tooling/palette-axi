@@ -13,9 +13,11 @@ vault casing. The auth flow, ProjectUid resolution, and pagination gotchas
 were documented in prose across the `spectrocloud-*` skills but weren't
 executable. This makes them executable.
 
-**READ-ONLY.** No verb creates, updates, deletes, or deploys anything. See
-[Future work](#future-work-not-implemented) for the write case that was
-deliberately left out.
+**Reads and writes (since 0.6.0).** Write verbs cover the profile and cluster
+flows agents were still hand-rolling with `curl`/`urllib` (see
+[Write verbs](#write-verbs-and-the-safety-model)). Every write supports
+`--dry-run`, needs an explicit `--project`, and refuses to touch anything
+outside that project.
 
 ## Install
 
@@ -157,7 +159,56 @@ palette-axi packs cni-calico --full                        # every version, not 
 palette-axi registries                                    # all pack/helm/oci registries, tenant-wide
 palette-axi registries --kind oci                          # one kind only
 palette-axi registries "Public Repo"                       # describe one by name or uid
+
+# 0.6.0 reads
+palette-axi cluster kubeconfig rpi-inference --project SA-Craig-Smith           # ./rpi-inference.kubeconfig, mode 600
+palette-axi cluster kubeconfig rpi-inference --project SA-Craig-Smith --admin --out ~/.kube/rpi.yaml
+palette-axi cluster variables dane-first-cluster --project SA-Craig-Smith      # current values per profile
+palette-axi cluster rbac rpi-inference --project SA-Craig-Smith
+palette-axi cluster events rpi-inference --project SA-Craig-Smith               # same as `events`
+palette-axi pcgs                                                                 # PCGs: state, health, version, heartbeat
+palette-axi pcg custeng-maas-sbx-pcg-1
+palette-axi cloudaccount smc-maas-01 --project SA-Craig-Smith                   # credentials masked
+palette-axi clustergroups --project SA-Craig-Smith ; palette-axi clustergroup <name|uid> --project ...
+palette-axi vclusters --project SA-Craig-Smith
+palette-axi profile export craig-nvidia --version 25.3.0 --project SA-Craig-Smith --out craig-nvidia.json
 ```
+
+### Write verbs and the safety model
+
+```
+palette-axi profile create --file body.json --project P [--publish]
+palette-axi profile version <ref>|--from <uid> --version 1.2.1 --project P [--set-pack-values edge-k8s=values.yaml ...] [--no-publish]
+palette-axi profile variables set <ref> --project P (--file vars.json | --set name=default ...)
+palette-axi profile publish <ref> [--version X] --project P
+palette-axi profile delete <ref> [--version X] --project P --yes
+palette-axi cluster create edge-native|maas|virtual --file body.json --project P
+palette-axi cluster profiles attach <cluster> --profile <ref> [--version X] [--var n=v ...] --project P
+palette-axi cluster profiles swap <cluster> --from <uid> --to <ref> [--to-version X] [--var n=v ...] --project P
+palette-axi cluster rbac set <cluster> --file rbacs.json --project P
+palette-axi cluster delete <cluster> --project P --yes [--force]
+palette-axi cloudaccount create maas --project P --name N --endpoint URL --api-key-env VAR [--pcg <ref>]
+palette-axi edgehost token create <name> [--out FILE | --stdout]     # tenant-scoped
+```
+
+The two-word forms (`profile create`, `cluster profiles swap`, ...) are rewritten
+to hyphenated verbs (`profile-create`, `cluster-profiles-swap`) before parsing,
+so `profile <ref>` and `cluster <ref>` behave exactly as before. A profile or
+cluster literally named `create`/`delete`/... has to be addressed by uid.
+
+Safety rules, enforced in code and covered by `tests/test_write_verbs.py`:
+
+| Rule | How |
+|---|---|
+| Project is explicit | Every write needs `--project <name|uid>` on the command line. `$PALETTE_PROJECT` is **not** honored for writes, so a stale env var can't pick where a create or delete lands. Edge host tokens are the one tenant-scoped write (the API rejects a `ProjectUid` header there). |
+| `--dry-run` | Runs the reads needed to build the request, then prints every write it would send (method, path with query, ProjectUid, JSON body) and sends none. Secret-shaped keys (`apiKey`, `password`, `token`, ...) print as `********`. |
+| Never outside the project | Before any edit or delete, the target's `metadata.annotations` must say `scope=project` and `projectUid=<--project>`; otherwise exit 4. Tenant-scoped objects are visible from a project and are never changed from one. |
+| Deletes need `--yes` | Without it, exit 4 naming exactly what would be deleted. `profile delete` also refuses a version any cluster uses. |
+| `cluster delete --force` | Only when the cluster is already `Deleting`: Palette refuses `forceDelete=true` otherwise (and for ~15 min after an aborted delete). |
+| Profiles get new versions | `profile version` clones server-side; the source version is never edited. `profile variables set` refuses an in-use version (Palette would answer `VariableUpdateFailure`) and points at `profile version`. |
+| Swaps keep variables | `cluster profiles swap` reads current values from `GET /v1/spectroclusters/{uid}/variables` and re-supplies them for the new uid, plus `--var` overrides, and keeps every other attached profile. Masked sensitive values can't be carried: it refuses unless each is given with `--var` or `--allow-sensitive-reset` is passed. |
+| Known silent failures refused | `cluster create edge-native` refuses `cloudConfig.vip` (dropped silently by the API; use `controlPlaneEndpoint {host, type: VIP}`). |
+| Credentials never on argv or stdout | MAAS API key comes from `--api-key-env`/`--api-key-file`. Kubeconfigs and edge host tokens go to mode-600 files unless `--stdout`. `cloudaccount` masks every secret-shaped field, `--json` included. |
 
 ## Verbs and the evidence behind each
 
@@ -178,10 +229,28 @@ palette-axi registries "Public Repo"                       # describe one by nam
 | `registries` | `GET /v1/registries/metadata` (list) + `GET /v1/registries/{pack,helm,oci}/{uid}` (describe) | 43 combined transcript refs, 30.2% failing — the worst fail rate of any bucket with double-digit volume, and zero prior coverage. `metadata` is the one endpoint that actually lists all three kinds; `GET /v1/registries/oci` itself 405s (`Allow: DELETE`). See [Real API behavior](#real-api-behavior-discovered-while-building-this-not-documented-anywhere) below. |
 | `doctor` | Same read the `projects` verb uses, `limit=1` | Not a Palette data verb — checks whether 1Password and the Palette API are actually usable before you run one of the above. See [Configure](#configure). |
 
-Full profile/cluster/cloudconfig **create-or-update** flows were left out —
-the task scope is the verbs actually used for **inspection**; write flows
-(build a profile, then create a cluster, then tune its cloud config) are
-explicitly out of scope for v1.
+0.6.0 verbs, from an 11/18/26 transcript pass over 30 days of sessions (553
+hand-rolled Palette calls; the ranked table is in the PR that added them):
+
+| Verb | Endpoint(s) |
+|---|---|
+| `cluster kubeconfig` | `GET /v1/spectroclusters/{uid}/assets/{kubeconfig,adminKubeconfig,kubeconfigclient}` (Accept: octet-stream) |
+| `cluster variables` | `GET /v1/spectroclusters/{uid}/variables` |
+| `cluster rbac` / `rbac set` | `GET` / `PUT /v1/spectroclusters/{uid}/config/rbacs` |
+| `cluster create` | `POST /v1/spectroclusters/{edge-native,maas,virtual}` |
+| `cluster profiles attach` | `PATCH /v1/spectroclusters/{uid}/profiles?resolveNotification=false` |
+| `cluster profiles swap` | `GET .../variables`, `PUT /v1/spectroclusters/{uid}/profiles` |
+| `cluster delete` | `DELETE /v1/spectroclusters/{uid}[?forceDelete=true]` |
+| `profile create` | `POST /v1/clusterprofiles`, `PUT .../variables`, `PATCH .../publish` |
+| `profile version` | `POST /v1/clusterprofiles/{uid}/clone`, `PUT /v1/clusterprofiles/{new}/packs/{name}`, `PATCH .../publish` |
+| `profile variables set` | `PUT /v1/clusterprofiles/{uid}/variables` |
+| `profile publish` / `delete` | `PATCH .../publish` / `DELETE /v1/clusterprofiles/{uid}` |
+| `profile export` | `GET /v1/clusterprofiles/{uid}/export` (Accept: octet-stream) |
+| `pcgs` / `pcg` | `GET /v1/overlords[/{uid}]` |
+| `cloudaccount` / `create maas` | `GET /v1/cloudaccounts/{kind}/{uid}` (masked) / `POST /v1/cloudaccounts/maas?privateGateway=` |
+| `clustergroups` / `clustergroup` | `GET /v1/clustergroups/hostCluster/metadata` / `GET /v1/clustergroups/{uid}` |
+| `vclusters` | the `clusters` search, filtered to cloudType nested/virtual |
+| `edgehost token create` | `POST /v1/edgehosts/tokens` (no ProjectUid) |
 
 ## Real API behavior discovered while building this (not documented anywhere)
 
@@ -334,6 +403,34 @@ skills:
   behavior change to a verb this task didn't touch, out of scope for a
   no-mistakes-mode change without its own dedicated evidence and review.
 
+- **(11/18/26) `GET /v1/clusterprofiles` now answers `405: method GET is not
+  allowed, but [POST] are`**, which broke `profiles` and `profile`.
+  `POST /v1/dashboard/clusterprofiles` (filter body) serves the list but
+  returns one row per profile *name*, with every version under
+  `specSummary.versions[]`. `profiles` expands them back to one row per
+  version, newest first. `profile <uid>` now GETs the uid directly.
+- **(11/18/26) Octet-stream endpoints fake success under `Accept:
+  application/json`.** `assets/kubeconfig`, `assets/adminKubeconfig` and
+  `clusterprofiles/{uid}/export` answer 200 with the 14-byte body
+  `{"Reader":{}}`. `api_raw()` sends `Accept: application/octet-stream`, and
+  `cluster kubeconfig` refuses to write anything that isn't a kubeconfig.
+- **(11/18/26) `POST /v1/clusterprofiles/{uid}/clone` `{metadata:{name,
+  version}}` returns an already-published copy**, and
+  `PUT /v1/clusterprofiles/{uid}/packs/{name}` edits that copy's *draft*: the
+  published values don't change until `PATCH .../publish`. Verified with a
+  throwaway `paxi-selftest-111826` profile (created, cloned, published,
+  exported, deleted).
+- **(11/18/26) `GET /v1/spectroclusters/{uid}/variables` returns a bare list**
+  `[{profileUid, variables:[{name, value, defaultValue, isSensitive, ...}]}]`.
+- **(11/18/26) `429 TooManyRequests`** showed up during a burst of probes.
+  `api()` retries a 429 up to 3 times (Retry-After honored, capped at 15s); a
+  429 means the request wasn't processed, so this is safe for writes too.
+- **(11/18/26) `GET /v1/clustergroups` is POST-only (create)** and
+  `/v1/dashboard/clustergroups` 404s. `clustergroups` uses
+  `GET /v1/clustergroups/hostCluster/metadata`. Not verified against a
+  populated project; SA-Craig-Smith had no groups left. `vclusters`' cloudType
+  filter (`nested`/`virtual`) is likewise unverified live.
+
 Every list verb that can detect this (via `listmeta.count`) prints a `note:`
 line naming exactly how many rows it got vs. how many the API claims exist,
 rather than silently showing a partial list as if it were complete.
@@ -348,7 +445,7 @@ Matches `opp-axi`'s contract so both tools compose in the same agent loop:
 | 1 | `E_ERR` | API/network/op error, or anything not covered below |
 | 2 | `E_USAGE` | bad args, or a name that's ambiguous and needs disambiguating |
 | 3 | `E_NOTFOUND` | no such project/cluster/profile/edge host/pack/tenant/registry/cloudconfig |
-| 4 | `E_REFUSED` | reserved for policy refusals — v1 has no write path to refuse, kept for symmetry with `opp-axi` and for any future verb that needs to say no |
+| 4 | `E_REFUSED` | a write refused on policy: outside `--project`, delete without `--yes`, `--force` on a non-Deleting cluster, in-use profile, masked sensitive variable on a swap, a known-silent-failure body |
 
 ## Env overrides
 
@@ -363,16 +460,10 @@ Matches `opp-axi`'s contract so both tools compose in the same agent loop:
 
 ## Future work (not implemented)
 
-**Write verbs** — create/update a cluster profile, create a cluster, delete a
-cluster, create an edge host registration token. All heavily represented in
-the transcripts (profile/cluster create flows are most of the write-side
-599 calls this tool's evidence came from) but explicitly out of scope for v1
-per the build brief: this tool is read-only. If it's built later, it should
-keep the same disambiguation-before-action contract as `resolve_project` /
-`resolve_by_name` here (never act on a name match without confirming it's
-unique), and should very likely require a `--yes`/confirmation flag before
-any DELETE, matching the caution the `spectrocloud-clusters` skill already
-uses for teardown flows.
+- PCG registration/pairing token helpers (`palette pcg install` covers it today).
+- Edge host token list/delete, cluster group create, machine pool edits
+  (`PATCH /v1/spectroclusters/{uid}/machinePools/...`), cloudconfig PUTs.
+- Server-side validation (`?validateOnly`) before `cluster create`.
 
 ## Develop
 

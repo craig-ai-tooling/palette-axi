@@ -20,7 +20,11 @@ handling is not, unless something has actually changed on the Palette side.
 
 Agent-ergonomic CLI over the Spectro Cloud Palette API: TOON output, pre-computed
 aggregates, definitive empty states, structured exit codes, next-step disclosure.
-**READ-ONLY** — no verb creates, updates, deletes, or deploys anything. Sibling to
+Reads and, since 0.6.0, writes. Every write verb takes `--dry-run`, needs an explicit
+`--project` (never `$PALETTE_PROJECT`), refuses anything outside that project (exit 4),
+and deletes need `--yes` — README "Write verbs and the safety model". Never run a write
+verb against a real resource to test it: `--dry-run`, or a throwaway `paxi-selftest-*`
+profile you create and delete yourself. Sibling to
 `launchpad-axi` / `opp-axi`; same AXI (Agent eXperience Interface) conventions and the
 same packaging standard.
 
